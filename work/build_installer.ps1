@@ -54,7 +54,11 @@ if ($code -ne 0) { throw "PyInstaller failed with exit code $code" }
 
 $built = Join-Path $distDir 'PDF标签编辑器-安装程序.exe'
 if (-not (Test-Path -LiteralPath $built)) { throw "missing installer output: $built" }
-$target = Join-Path $OutDir 'PDF标签编辑器-安装程序-1.0.0.exe'
+$versionText = Get-Content -LiteralPath 'outputs\PDF小工具\updater.py' -Raw -Encoding UTF8
+$appVersion = if ($versionText -match "APP_VERSION = '([^']+)'") { $matches[1] } else { '1.0.0' }
+$target = Join-Path $OutDir "PDF标签编辑器-安装程序-$appVersion.exe"
+$ascii = Join-Path $OutDir "PDFLabelEditor-Setup-$appVersion.exe"
+Copy-Item -LiteralPath $built -Destination $ascii -Force
 Copy-Item -LiteralPath $built -Destination $target -Force
 $file = Get-Item -LiteralPath $target
 Write-Host ('Installer: {0}  {1:N1} MB' -f $file.FullName, ($file.Length / 1MB))
