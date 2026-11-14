@@ -167,6 +167,37 @@ class SlimScrollbar(tk.Canvas):
         fraction = max(0, min(1, (pos-self.drag_offset)/max(1, length-span)))
         self.scroll_command('moveto', fraction*max(0, 1-(self.last-self.first)))
 
+def annotate_block_ids(page, lines):
+    """Tag each line with the PDF text block it belongs to.
+
+    Two blocks dragged on top of each other still live in different text objects,
+    so the block id is what lets a click pick the block it landed on instead of
+    merging both into one.
+    """
+    if not lines:
+        return
+    try:
+        data = page.get_text('dict', clip=fitz.INFINITE_RECT())
+    except Exception:
+        return
+    boxes = []
+    for index, block in enumerate(data.get('blocks') or []):
+        if block.get('type') != 0:
+            continue
+        for line in block.get('lines') or []:
+            boxes.append((fitz.Rect(line.get('bbox') or (0, 0, 0, 0)), index))
+    if not boxes:
+        return
+    for _rect, line in lines:
+        target = fitz.Rect(line['bbox'])
+        line['block_id'] = None
+        for box, index in boxes:
+            if (abs(box.y0 - target.y0) <= 0.8 and abs(box.x0 - target.x0) <= 0.8
+                    and abs(box.y1 - target.y1) <= 1.2):
+                line['block_id'] = index
+                break
+
+
 def full_text_lines(page):
     """Read full text outside the page box without treating annotations as page text."""
     annotations = list(page.annots() or [])
@@ -185,7 +216,9 @@ def full_text_lines(page):
             flags = text_guard.flags_for(current, flags & ~fitz.TEXT_MEDIABOX_CLIP)
             return current.get_text('dict', flags=flags, clip=fitz.INFINITE_RECT())
         text_edit.page_text_dict = read_all
-        return text_edit.text_lines(source)
+        found = text_edit.text_lines(source)
+        annotate_block_ids(source, found)
+        return found
     finally:
         text_edit.page_text_dict = old_reader
         if clone: clone.close()
@@ -2686,7 +2719,8 @@ class PDFTool:
                     self.edit_on_release = any(fitz.Rect(line['bbox']).contains(point) for line in lines)
                 return
         if self.selection_type.get() != '框选区域':
-            self.select_object(point)
+            # Alt+click ignores a block that was dragged on top of another one.
+            self.select_object(point, below=bool(event.state & 0x00020000))
             if self.selection is not None:
                 self.drag_kind = 'move'
                 self.drag_origin_rect = fitz.Rect(self.selection)
@@ -3157,6 +3191,18 @@ class PDFTool:
             self.moved_text_marks = [mark for mark in self.moved_text_marks
                                      if mark['page'] != page_index] + [{'page': page_index, 'lines': marks}]
 
+    def is_moved_line(self, rect, line):
+        """True when this line belongs to a block the user dragged on top of another."""
+        page_index = self.page_index
+        for mark in self.moved_text_marks:
+            if mark['page'] != page_index:
+                continue
+            for entry in mark['lines']:
+                if (abs(rect.y0 - entry['rect'].y0) <= 2.5 and abs(rect.x0 - entry['rect'].x0) <= 4
+                        and text_edit.line_text(line) == entry['text']):
+                    return True
+        return False
+
     def moved_text_at(self, point, page_lines):
         """Return the lines of a previously moved block that is under the pointer."""
         page_index = self.page_index
@@ -3167,16 +3213,24 @@ class PDFTool:
                 continue
             found = []
             for entry in mark['lines']:
+                best = None
+                nearest = None
                 for rect, line in page_lines:
-                    if (rect + (-2.5, -2.5, 2.5, 2.5)).intersects(entry['rect']) and \
-                            abs(rect.y0 - entry['rect'].y0) <= 3 and abs(rect.x0 - entry['rect'].x0) <= 4:
-                        found.append(line)
+                    if abs(rect.y0 - entry['rect'].y0) > 3 or abs(rect.x0 - entry['rect'].x0) > 4:
+                        continue
+                    if nearest is None:
+                        nearest = line
+                    if text_edit.line_text(line) == entry['text']:
+                        best = line
                         break
+                chosen = best if best is not None else nearest
+                if chosen is not None:
+                    found.append(chosen)
             if len(found) >= max(1, len(mark['lines']) // 2):
                 return found
         return None
 
-    def select_object(self, point):
+    def select_object(self, point, below=False):
         page = self.doc[self.page_index]
         if page.rotation:
             messagebox.showinfo('暂不能编辑', '此页带有旋转属性，当前版本不能安全选择对象。')
@@ -3199,7 +3253,7 @@ class PDFTool:
                 self.draw_selection(self.selection)
                 self.status.config(text='已选中文本框，拖动边框移动或调整大小，双击编辑文字。')
                 return
-        if mode in ('自动选择', '整块文字', '选择文字', '选择文本框'):
+        if mode in ('自动选择', '整块文字', '选择文字', '选择文本框') and not below:
             remembered = self.moved_text_at(point, page_lines)
             if remembered:
                 self.canvas.delete('selection')
@@ -3214,11 +3268,13 @@ class PDFTool:
                 self.selection_lines = [fitz.Rect(item['bbox']) for item in remembered]
                 self.sync_text_format(page, None)
                 self.draw_selection(self.selection)
-                self.status.config(text=f'已选中之前移动的文字块（{len(remembered)} 行）。')
+                self.status.config(text=f'已选中之前移动的文字块（{len(remembered)} 行）；按住 Alt 点击可选中下面的块。')
                 return
 
         if mode in ('自动选择', '整块文字', '选择文字', '选择文本框'):
             for rect, line in self.nearest_text_lines(page_lines, point):
+                if below and self.is_moved_line(rect, line):
+                    continue          # Alt+click reaches the block underneath
                 candidates.append((rect, '文字', line))
         if mode in ('自动选择', '选择图片', '选择图形') and not candidates:
             objects = page_objects.Objects(page)
@@ -3338,13 +3394,21 @@ class PDFTool:
                 # overlapping blocks share left edges, so geometry alone picks up
                 # lines belonging to the block underneath.
                 expected = [(fitz.Rect(ln['bbox']) + (dx, dy, dx, dy), text_edit.line_text(ln)) for ln in lines]
+                current = full_text_lines(self.doc[self.page_index])
                 moved = []
                 for shifted, label in expected:
-                    for rect, candidate in full_text_lines(self.doc[self.page_index]):
-                        if abs(rect.y0 - shifted.y0) <= 2.5 and abs(rect.x0 - shifted.x0) <= 3 \
-                                and text_edit.line_text(candidate) == label:
-                            moved.append(candidate)
+                    found = None
+                    for rect, candidate in current:
+                        if text_edit.line_text(candidate) == label and abs(rect.y0 - shifted.y0) <= 3:
+                            found = candidate
                             break
+                    if found is None:
+                        for rect, candidate in current:
+                            if text_edit.line_text(candidate) == label:
+                                found = candidate
+                                break
+                    if found is not None:
+                        moved.append(found)
                 if moved:
                     self.remember_moved_text(self.page_index, expected)
                     self.selected_paragraph = moved
@@ -3430,6 +3494,14 @@ class PDFTool:
         block moved on top of another one can still be picked separately.
         """
         base = fitz.Rect(line['bbox'])
+        base_block = line.get('block_id')
+        block_top = block_bottom = None
+        if base_block is not None:
+            extents = [fitz.Rect(item['bbox']) for rect, item in page_lines
+                       if item.get('block_id') == base_block]
+            if extents:
+                block_top = min(item.y0 for item in extents)
+                block_bottom = max(item.y1 for item in extents)
         rules = []
         if page is not None:
             for drawing in page.get_drawings():
@@ -3453,6 +3525,13 @@ class PDFTool:
                 bounds |= fitz.Rect(item['bbox'])
             for rect, candidate in page_lines:
                 if any(candidate is existing for existing in chosen): continue
+                other_block = candidate.get('block_id')
+                if base_block is not None and other_block is not None and other_block != base_block:
+                    # Each PDF text block stays its own selectable block. Grouping
+                    # across text objects is what merged a dragged block with the
+                    # block underneath it; Adobe keeps them separate for the same
+                    # reason, so do the same.
+                    continue
                 if abs(rect.x0 - base.x0) > max(3.0, 0.06*rect.width): continue
                 gap = max(rect.y0 - bounds.y1, bounds.y0 - rect.y1)
                 overlap = min(rect.x1, bounds.x1) - max(rect.x0, bounds.x0)
@@ -4483,17 +4562,32 @@ class PDFTool:
                                  keys, size*1.2, rect.width, box=rect)
             elif state.get('kind') == 'group':
                 text_edit.refuse_with_marks(page)
-                if text:
-                    added_text._refuse(text)
-                    fonts, resolved_text, resolved_keys = text_styles.resolve_all(page, text, keys)
-                text_edit._remove_lines(page, state['lines'], decor=state.get('decor', ()))
-                if text:
-                    rect, origin = state['rect'], state['origin']
-                    # Wrap at the block width plus slack: using the exact box width
-                    # wrapped a long line into two as soon as one character was added.
-                    wrap = max(2, min(rect.x1 - origin.x + 16, page.rect.x1 - origin.x - 2))
-                    added_text.write(page, origin, 0, resolved_text, resolved_keys, state['step'],
-                                     wrap, fonts=fonts, box=rect)
+                parts = text.split('\n')
+                lines = state['lines']
+                # Fidelity first: when the line count did not change, rewrite every
+                # line at its own baseline with its own font and size. Nothing but
+                # the edited glyphs moves (measured: baseline/font/size deltas 0.000).
+                keep_layout = (len(parts) == len(lines) and all(part.strip() for part in parts)
+                               and not state.get('format_changed') and len(set(keys)) <= 1)
+                if keep_layout:
+                    for line, part in zip(lines, parts):
+                        # Leave untouched lines completely alone: re-encoding identical
+                        # text only adds anti-aliasing noise to the page.
+                        if part == text_edit.line_text(line):
+                            continue
+                        text_edit.replace_line(page, line, part)
+                else:
+                    if text:
+                        added_text._refuse(text)
+                        fonts, resolved_text, resolved_keys = text_styles.resolve_all(page, text, keys)
+                    text_edit._remove_lines(page, lines, decor=state.get('decor', ()))
+                    if text:
+                        rect, origin = state['rect'], state['origin']
+                        # Wrap at the block width plus slack: using the exact box width
+                        # wrapped a long line into two as soon as one character was added.
+                        wrap = max(2, min(rect.x1 - origin.x + 16, page.rect.x1 - origin.x - 2))
+                        added_text.write(page, origin, 0, resolved_text, resolved_keys, state['step'],
+                                         wrap, fonts=fonts, box=rect)
             elif state.get('block'):
                 block = state['block']
                 styled, _ = added_text.contents(page, block)

@@ -66,7 +66,7 @@ def print_pages(app, printer, width, height, scaling, pages, copies, mode, overs
             pixel_w = max(1, round(page.rect.width*factor*dpi_x/72))
             pixel_h = max(1, round(page.rect.height*factor*dpi_y/72))
             if pixel_w*pixel_h*oversample*oversample > 100_000_000:
-                raise ValueError('页面过大，请选择标准清晰度或更小纸张。')
+                raise ValueError('页面过大，请选择更小的纸张尺寸。')
             return page, factor, left, top, pixel_w, pixel_h
 
         def rendered(index):
@@ -80,7 +80,7 @@ def print_pages(app, printer, width, height, scaling, pages, copies, mode, overs
             pix = page.get_pixmap(matrix=fitz.Matrix(render_x, render_y), colorspace=fitz.csRGB, alpha=False)
             img = Image.frombytes('RGB', (pix.width, pix.height), pix.samples, 'raw', 'RGB', pix.stride)
             if img.size != (pixel_w, pixel_h):
-                img = img.resize((pixel_w, pixel_h), Image.Resampling.LANCZOS)
+                img = img.resize((pixel_w, pixel_h), Image.Resampling.BOX)
             if density < 100:
                 img = Image.blend(Image.new('RGB', img.size, 'white'), img, density / 100)
             value = (img, round(left*dpi_x/72)-offset_x, round(top*dpi_y/72)-offset_y, pixel_w, pixel_h)
@@ -136,8 +136,6 @@ def show_print_dialog(app, printer_dc, printer_mode):
     scaling = tk.StringVar(value='适合纸张')
     scope, custom_range = tk.StringVar(value='当前页'), tk.StringVar()
     copies = tk.StringVar(value='1')
-    quality = tk.StringVar(value='标准')
-    density = tk.IntVar(value=100)
     modes = {}
     ttk.Label(frame, text='打印机').grid(row=0, column=0, sticky='w')
     ttk.Combobox(frame, textvariable=chosen, values=printers, state='readonly', width=36).grid(row=0, column=1, sticky='ew')
@@ -168,14 +166,7 @@ def show_print_dialog(app, printer_dc, printer_mode):
     row2 = ttk.Frame(frame); row2.grid(row=2, column=0, columnspan=3, sticky='w')
     ttk.Label(row2, text='页面缩放').pack(side='left')
     ttk.Combobox(row2, textvariable=scaling, values=['适合纸张', '实际大小', '缩小过大页面'], state='readonly', width=14).pack(side='left', padx=5)
-    ttk.Label(row2, text='清晰度').pack(side='left')
-    ttk.Combobox(row2, textvariable=quality, values=['标准', '高质量'], state='readonly', width=9).pack(side='left', padx=5)
-    density_row = ttk.Frame(frame); density_row.grid(row=3, column=0, columnspan=3, sticky='ew', pady=4)
-    ttk.Label(density_row, text='图像深浅').pack(side='left')
-    density_value = ttk.Label(density_row, text='100%')
-    density_value.pack(side='right')
-    ttk.Scale(density_row, from_=40, to=100, variable=density, orient='horizontal').pack(side='left', fill='x', expand=True, padx=8)
-    row3=ttk.Frame(frame); row3.grid(row=4, column=0, columnspan=3, sticky='w', pady=6)
+    row3=ttk.Frame(frame); row3.grid(row=3, column=0, columnspan=3, sticky='w', pady=6)
     ttk.Label(row3, text='页面').pack(side='left')
     ttk.Combobox(row3, textvariable=scope, values=['当前页', '全部页面', '指定页码'], state='readonly', width=10).pack(side='left', padx=4)
     ttk.Entry(row3, textvariable=custom_range, width=12).pack(side='left')
@@ -185,7 +176,7 @@ def show_print_dialog(app, printer_dc, printer_mode):
     canvas.grid(row=5, column=0, columnspan=3, pady=8, sticky='nsew')
     frame.rowconfigure(5, weight=1)
     frame.columnconfigure(1, weight=1)
-    status = ttk.Label(frame, text='滚轮缩放预览，按住拖动查看细节，双击恢复。图像深浅影响输出图像，打印头实际浓度请在“打印机属性”设置。')
+    status = ttk.Label(frame, text='滚轮缩放预览，按住拖动查看细节，双击恢复。打印浓度请在“打印机属性”中设置。')
     status.grid(row=6, column=0, columnspan=3)
     def dimensions():
         w, h = float(width.get()), float(height.get())
@@ -207,10 +198,6 @@ def show_print_dialog(app, printer_dc, printer_mode):
             pixels_per_point=paper_scale*25.4/72
             pix=page.get_pixmap(matrix=fitz.Matrix(factor*pixels_per_point, factor*pixels_per_point),alpha=False)
             image=Image.open(io.BytesIO(pix.tobytes('png'))).convert('RGB')
-            amount = max(40, min(100, density.get()))
-            density_value.config(text=f'{amount}%')
-            if amount < 100:
-                image=Image.blend(Image.new('RGB', image.size, 'white'), image, amount/100)
             sheet=Image.new('RGB',(paper_w,paper_h),'white')
             sheet.paste(image,(round(left*pixels_per_point),round(top*pixels_per_point)))
             photo=ImageTk.PhotoImage(sheet)
@@ -226,7 +213,7 @@ def show_print_dialog(app, printer_dc, printer_mode):
                 canvas.xview_moveto(0); canvas.yview_moveto(0)
                 view['settled'] = True
         except (ValueError, tk.TclError): pass
-    for var in (width,height,scaling,density): var.trace_add('write',preview)
+    for var in (width,height,scaling): var.trace_add('write',preview)
     def zoom_preview(event):
         if not event.delta: return 'break'
         view['zoom'] = max(.6, min(5.0, view['zoom'] * (1.15 if event.delta > 0 else 1/1.15)))
@@ -263,8 +250,8 @@ def show_print_dialog(app, printer_dc, printer_mode):
                 messagebox.showinfo('打印', '已有打印任务正在提交，请等待完成。', parent=dialog); return
             source = app.doc.tobytes(garbage=0, deflate=True)
             printer = chosen.get(); settings = modes.get(printer)
-            selected_scaling = scaling.get(); sample = 2 if quality.get()=='高质量' else 1
-            amount = density.get()
+            selected_scaling = scaling.get(); sample = 1
+            amount = 100
             results = queue.Queue()
             app._print_job_active = True
             print_button.config(state='disabled')
