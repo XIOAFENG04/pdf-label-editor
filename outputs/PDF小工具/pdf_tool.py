@@ -318,6 +318,7 @@ class PDFTool:
         self.page_height = 0
         self.last_file_stat = None
         self.selection = None
+        self.selection_lines = []
         self.drag_start = None
         self.drag_kind = None
         self.drag_origin_rect = None
@@ -613,6 +614,7 @@ class PDFTool:
         self.canvas.bind('<ButtonRelease-1>', self.release)
         self.canvas.bind('<Button-3>', self.context_menu)
         self.canvas.bind('<Double-Button-1>', self.double_click)
+        self.canvas.bind('<Triple-Button-1>', self.triple_click)
         self.canvas.bind('<MouseWheel>', self.mouse_wheel)
         self.canvas.bind('<Shift-MouseWheel>', self.horizontal_wheel)
         self.canvas.bind('<Control-MouseWheel>', self.zoom_wheel)
@@ -2839,6 +2841,7 @@ class PDFTool:
             sx, sy = rect.width/self.selection.width, rect.height/self.selection.height
             quad = [fitz.Point(rect.x0+(p.x-self.selection.x0)*sx, rect.y0+(p.y-self.selection.y0)*sy) for p in quad]
         self.draw_selection_quad(quad, color)
+        self.draw_selection_lines()
 
     def selection_quad(self):
         r = self.selection
@@ -3055,6 +3058,56 @@ class PDFTool:
                 members.add(item['n'])
         return bounds, {'kind':'barcode', 'members':sorted(members)}
 
+    @staticmethod
+    def rect_distance(rect, point):
+        """Distance from a point to a rectangle (0 when inside)."""
+        dx = max(rect.x0 - point.x, 0.0, point.x - rect.x1)
+        dy = max(rect.y0 - point.y, 0.0, point.y - rect.y1)
+        return math.hypot(dx, dy)
+
+    def nearest_text_lines(self, page_lines, point, tolerance=None):
+        """Text lines near the click, nearest first.
+
+        Adobe-like behaviour: clicking just above/below a line still picks that
+        line instead of requiring the pointer to be inside its box.
+        """
+        ranked = []
+        for rect, line in page_lines:
+            if not text_edit.visible(line):
+                continue
+            ranked.append((self.rect_distance(rect, point), rect.get_area(), rect, line))
+        if not ranked:
+            return []
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        if tolerance is None:
+            height = min(16.0, max(4.0, ranked[0][2].height))
+            tolerance = max(3.0, height * 0.85)
+        return [(rect, line) for distance, _, rect, line in ranked if distance <= tolerance]
+
+    def word_at_point(self, point):
+        """The word under the pointer, as (rect, text)."""
+        page = self.doc[self.page_index]
+        try:
+            words = page.get_text('words', clip=fitz.INFINITE_RECT())
+        except Exception:
+            words = page.get_text('words')
+        best = None
+        for item in words:
+            rect = fitz.Rect(item[:4])
+            if (rect + (-1.2, -1.2, 1.2, 1.2)).contains(point):
+                if best is None or rect.get_area() < best[0].get_area():
+                    best = (rect, str(item[4]))
+        return best
+
+    def draw_selection_lines(self):
+        """Thin outline per selected text line so a multi-line pick reads clearly."""
+        lines = getattr(self, 'selection_lines', None) or []
+        for line_rect in lines:
+            self.canvas.create_rectangle(
+                self.origin_x + line_rect.x0 * self.scale, self.origin_y + line_rect.y0 * self.scale,
+                self.origin_x + line_rect.x1 * self.scale, self.origin_y + line_rect.y1 * self.scale,
+                outline='#8fbcff', width=1, tags='selection')
+
     def select_object(self, point):
         page = self.doc[self.page_index]
         if page.rotation:
@@ -3079,11 +3132,8 @@ class PDFTool:
                 self.status.config(text='已选中文本框，拖动边框移动或调整大小，双击编辑文字。')
                 return
         if mode in ('自动选择', '整块文字', '选择文字', '选择文本框'):
-            for rect, line in page_lines:
-                # Pad vertically by a fraction of the line height so a click in the
-                # leading between two lines still lands on the nearest line.
-                pad_y = max(2, rect.height * 0.35)
-                if (rect + (-2, -pad_y, 2, pad_y)).contains(point) and text_edit.visible(line): candidates.append((rect, '文字', line))
+            for rect, line in self.nearest_text_lines(page_lines, point):
+                candidates.append((rect, '文字', line))
         if mode in ('自动选择', '选择图片', '选择图形') and not candidates:
             objects = page_objects.Objects(page)
             barcode = (self.barcode_group_at(objects, point) or self.matrix_group_at(objects, point)) if mode != '选择图片' else None
@@ -3104,6 +3154,7 @@ class PDFTool:
         self.canvas.delete('selection')
         if not candidates:
             self.selection = None
+            self.selection_lines = []
             self.selected_kind = None
             self.selected_line = None
             self.selected_paragraph = None
@@ -3138,6 +3189,10 @@ class PDFTool:
                     self.selection |= fitz.Rect(line['bbox'])
                 self.status.config(text=f'已选中整块文字（{len(self.selected_paragraph)} 行），再点一下即可整段编辑。')
         if self.selected_kind == '文字': self.sync_text_format(page, None)
+        if self.selected_kind == '文字':
+            self.selection_lines = [fitz.Rect(item['bbox']) for item in (self.selected_paragraph or [self.selected_line]) if item]
+        else:
+            self.selection_lines = []
         r = self.selection
         self.draw_selection(r)
         if self.selected_object and self.selected_object.get('kind') == 'barcode':
@@ -3581,8 +3636,47 @@ class PDFTool:
             return 'break'
         if self.selection_type.get() not in ('自动选择', '选择文字', '选择文本框'): return
         self.drag_start = None
-        self.select_object(fitz.Point((x-self.origin_x)/self.scale, (y-self.origin_y)/self.scale))
-        if self.selected_kind == '文字': self.start_inline((x, y))
+        point = fitz.Point((x-self.origin_x)/self.scale, (y-self.origin_y)/self.scale)
+        word = self.word_at_point(point)
+        self.select_object(point)
+        if self.selected_kind == '文字':
+            self.start_inline((x, y))
+            # Preselect the clicked word so typing replaces just that word.
+            if word and self.inline_editor and len(self.selected_paragraph or []) <= 1:
+                try:
+                    line_text = self.inline_editor.get('1.0', 'end-1c')
+                    start = line_text.find(word[1])
+                    if start >= 0:
+                        self.inline_editor.tag_add('sel', '1.0+%dc' % start, '1.0+%dc' % (start + len(word[1])))
+                        self.inline_editor.mark_set('insert', '1.0+%dc' % (start + len(word[1])))
+                except tk.TclError:
+                    pass
+
+    def triple_click(self, event):
+        """Triple click: select the text block (cell) around the pointer."""
+        if not self.doc:
+            return 'break'
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        point = fitz.Point((x - self.origin_x) / self.scale, (y - self.origin_y) / self.scale)
+        page = self.doc[self.page_index]
+        page_lines = full_text_lines(page)
+        ranked = self.nearest_text_lines(page_lines, point)
+        if not ranked:
+            return 'break'
+        rect, line = ranked[0]
+        self.select_object(rect.tl + (0.5, 0.5))
+        lines = self.text_block_lines(page_lines, line, page)
+        if not lines:
+            return 'break'
+        self.selected_line = line
+        self.selected_paragraph = lines
+        self.selection = fitz.Rect(lines[0]['bbox'])
+        for item in lines[1:]:
+            self.selection |= fitz.Rect(item['bbox'])
+        self.selection_lines = [fitz.Rect(item['bbox']) for item in lines]
+        self.draw_selection(self.selection)
+        self.status.config(text=f'已选中整块文字（{len(lines)} 行），双击整段编辑，拖动整块移动。')
+        return 'break'
 
     def reselect_graphic(self, target, kind):
         if self.selected_object and self.selected_object.get('kind') == 'barcode':

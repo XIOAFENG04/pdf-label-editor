@@ -10,7 +10,7 @@ import ssl
 import urllib.error
 import urllib.request
 
-APP_VERSION = '1.0.1'
+APP_VERSION = '1.1.0'
 DEFAULT_REPO = 'XIOAFENG04/pdf-label-editor'
 API = 'https://api.github.com/repos/{repo}/releases/latest'
 
