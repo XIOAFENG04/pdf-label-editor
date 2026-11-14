@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import io
 import time
@@ -319,6 +319,7 @@ class PDFTool:
         self.last_file_stat = None
         self.selection = None
         self.selection_lines = []
+        self.moved_text_marks = []
         self.drag_start = None
         self.drag_kind = None
         self.drag_origin_rect = None
@@ -463,6 +464,27 @@ class PDFTool:
         self.tab_control = ttk.Notebook(tabbar, height=1, style='Document.TNotebook')
         self.tab_control.pack(side='left', fill='x', expand=True)
         self.tab_control.bind('<<NotebookTabChanged>>', self.on_tab_change)
+
+        def tab_close_click(event):
+            try:
+                index = self.tab_control.index('@%d,%d' % (event.x, event.y))
+            except tk.TclError:
+                return None
+            tabs = self.tab_control.tabs()
+            if not tabs or index >= len(tabs):
+                return None
+            box = self.tab_control.bbox(index)
+            if not box:
+                return None
+            if event.x >= box[0] + box[2] - 18:
+                self.close_tab_by(tabs[index])
+                return 'break'
+            return None
+
+        self.tab_control.bind('<Button-1>', tab_close_click, add='+')
+        self.tab_control.bind('<Button-2>', lambda event: self.close_tab_by(
+            self.tab_control.tabs()[self.tab_control.index('@%d,%d' % (event.x, event.y))])
+            if self.tab_control.identify(event.x, event.y) == 'label' else None, add='+')
         RoundButton(tabbar, text='关闭标签', command=self.close_tab).pack(side='right', padx=(5,0))
         self.status = ttk.Label(root, text='打开 PDF 后，点击文字编辑；拖动边框移动或缩放。', style='Status.TLabel')
         self.status.pack(fill='x')
@@ -624,6 +646,7 @@ class PDFTool:
         self.resize_job = None
         self.root.after_idle(self.show_empty_workspace)
         self.enable_pdf_drop()
+        self.root.bind('<Control-Shift-Z>', lambda event: self.shortcut(event, self.redo))
         for key, action in [('z', self.undo), ('y', self.redo), ('o', self.open), ('s', self.save), ('c', self.copy_area), ('x', self.cut_area), ('v', self.paste_area)]:
             self.root.bind('<Control-'+key+'>', lambda event, fn=action: self.shortcut(event, fn))
         for event, action in [('<Control-Shift-S>', self.save_as), ('<Control-p>', self.print_pdf), ('<Control-plus>', lambda:self.zoom(1.1)), ('<Control-equal>', lambda:self.zoom(1.1)), ('<Control-minus>', lambda:self.zoom(1/1.1)), ('<Control-0>', self.fit_page), ('<Prior>', lambda:self.turn(-1)), ('<Next>', lambda:self.turn(1)), ('<Left>', lambda:self.canvas.xview_scroll(-3,'units')), ('<Right>', lambda:self.canvas.xview_scroll(3,'units')), ('<Up>', lambda:self.canvas.yview_scroll(-3,'units')), ('<Down>', lambda:self.canvas.yview_scroll(3,'units'))]:
@@ -2040,12 +2063,14 @@ class PDFTool:
 
     def shortcut(self, event, action):
         widget = event.widget
-        # A combobox is an Entry subclass, but Ctrl+Z there should still undo the
-        # document, not be swallowed because a dropdown had focus.
-        if isinstance(widget, ttk.Combobox):
-            action()
-            return 'break'
-        if isinstance(widget, (tk.Text, tk.Entry, ttk.Entry)):
+        # Inside the inline editor every key belongs to the text widget (it has
+        # its own undo stack); everywhere else Ctrl+Z / Ctrl+Y must undo the PDF.
+        if self.inline_editor is not None and widget is self.inline_editor:
+            return
+        if isinstance(widget, (tk.Text, tk.Entry, ttk.Entry, ttk.Combobox)):
+            if action == self.undo or action == self.redo:
+                action()
+                return 'break'
             return
         action()
         return 'break'
@@ -2274,6 +2299,9 @@ class PDFTool:
         self.root.after(400, self.poll_remote_paths)
 
     def close(self):
+        if getattr(self, 'closing', False):
+            return
+        self.closing = True
         self.save_window_state()
         if self.inline_editor and not self.apply_inline(): return
         while self.tabs:
@@ -2312,7 +2340,7 @@ class PDFTool:
         for name in ('doc','path','page_index','scale','last_file_stat','dirty','undo_data','redo_data'):
             state[name] = getattr(self,name)
         state['anchor'] = self.view_anchor() if self.doc and self.page_width else None
-        self.tab_control.tab(self.active_tab, text=Path(self.path).name + (' *' if self.dirty else ''))
+        self.tab_control.tab(self.active_tab, text=Path(self.path).name + (' *' if self.dirty else '') + '  ×')
 
     def open_path(self, path):
         canonical = os.path.normcase(os.path.abspath(path))
@@ -2329,7 +2357,7 @@ class PDFTool:
                 doc.close()
                 raise ValueError('暂不支持需要密码或没有页面的文件')
             frame = ttk.Frame(self.tab_control)
-            self.tab_control.add(frame, text=Path(path).name)
+            self.tab_control.add(frame, text=Path(path).name + '  ×')
             tab = str(frame)
             self.tabs[tab] = {'doc':doc,'path':path,'page_index':0,'scale':1.5,
                               'last_file_stat':hashlib.sha256(data).hexdigest(),'dirty':False,
@@ -2394,6 +2422,14 @@ class PDFTool:
             self.show_empty_workspace()
         return True
 
+    def close_tab_by(self, tab):
+        if not tab or tab not in self.tabs:
+            return False
+        if self.active_tab != tab:
+            self.tab_control.select(tab)
+            self.activate_tab(tab)
+        return self.close_tab()
+
     def view_anchor(self, screen_x=None, screen_y=None):
         width, height = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
         x = width/2 if screen_x is None else screen_x
@@ -2445,7 +2481,7 @@ class PDFTool:
     def show(self, anchor=None):
         if not self.doc: return
         if self.active_tab in self.tabs:
-            self.tab_control.tab(self.active_tab, text=Path(self.path).name + (' *' if self.dirty else ''))
+            self.tab_control.tab(self.active_tab, text=Path(self.path).name + (' *' if self.dirty else '') + '  ×')
         if anchor is None and self.page_width:
             anchor = self.view_anchor()
         self.canvas.delete('all')
@@ -2749,7 +2785,7 @@ class PDFTool:
                 dx,dy,_,_ = self.snap_movement((x1-x0)/self.scale, (y1-y0)/self.scale)
                 self.move_selected(dx, dy)
             elif self.edit_on_release and self.selected_kind == '文字':
-                group = self.selection_type.get() == '整块文字' and len(self.selected_paragraph or []) > 1
+                group = len(self.selected_paragraph or []) > 1
                 self.start_inline((x1, y1), explicit_group=group)
             return
         if abs(x1-x0)<5 and abs(y1-y0)<5 and self.selection_type.get() != '框选区域':
@@ -3108,6 +3144,38 @@ class PDFTool:
                 self.origin_x + line_rect.x1 * self.scale, self.origin_y + line_rect.y1 * self.scale,
                 outline='#8fbcff', width=1, tags='selection')
 
+    def remember_moved_text(self, page_index, entries):
+        """Remember where a moved block now sits, so it stays selectable after overlap.
+
+        entries: [(rect, text)] already shifted to the new position. Storing geometry
+        instead of re-reading the page keeps the mark exact even when two blocks share
+        the same left edge.
+        """
+        marks = [{'rect': fitz.Rect(rect), 'text': str(value)}
+                 for rect, value in entries if rect and not rect.is_empty]
+        if marks:
+            self.moved_text_marks = [mark for mark in self.moved_text_marks
+                                     if mark['page'] != page_index] + [{'page': page_index, 'lines': marks}]
+
+    def moved_text_at(self, point, page_lines):
+        """Return the lines of a previously moved block that is under the pointer."""
+        page_index = self.page_index
+        for mark in self.moved_text_marks:
+            if mark['page'] != page_index:
+                continue
+            if not any((entry['rect'] + (-2, -2, 2, 2)).contains(point) for entry in mark['lines']):
+                continue
+            found = []
+            for entry in mark['lines']:
+                for rect, line in page_lines:
+                    if (rect + (-2.5, -2.5, 2.5, 2.5)).intersects(entry['rect']) and \
+                            abs(rect.y0 - entry['rect'].y0) <= 3 and abs(rect.x0 - entry['rect'].x0) <= 4:
+                        found.append(line)
+                        break
+            if len(found) >= max(1, len(mark['lines']) // 2):
+                return found
+        return None
+
     def select_object(self, point):
         page = self.doc[self.page_index]
         if page.rotation:
@@ -3131,6 +3199,24 @@ class PDFTool:
                 self.draw_selection(self.selection)
                 self.status.config(text='已选中文本框，拖动边框移动或调整大小，双击编辑文字。')
                 return
+        if mode in ('自动选择', '整块文字', '选择文字', '选择文本框'):
+            remembered = self.moved_text_at(point, page_lines)
+            if remembered:
+                self.canvas.delete('selection')
+                self.selected_block = None
+                self.selected_object = None
+                self.selected_kind = '文字'
+                self.selected_line = remembered[0]
+                self.selected_paragraph = remembered
+                self.selection = fitz.Rect(remembered[0]['bbox'])
+                for item in remembered[1:]:
+                    self.selection |= fitz.Rect(item['bbox'])
+                self.selection_lines = [fitz.Rect(item['bbox']) for item in remembered]
+                self.sync_text_format(page, None)
+                self.draw_selection(self.selection)
+                self.status.config(text=f'已选中之前移动的文字块（{len(remembered)} 行）。')
+                return
+
         if mode in ('自动选择', '整块文字', '选择文字', '选择文本框'):
             for rect, line in self.nearest_text_lines(page_lines, point):
                 candidates.append((rect, '文字', line))
@@ -3176,7 +3262,17 @@ class PDFTool:
         self.selected_object = selected if self.selected_kind in ('图片', '图形') else None
         self.selection = fitz.Rect(self.selection)
         self.selected_paragraph = None
-        if self.selected_kind == '文字' and mode in ('自动选择', '选择文本框'):
+        if self.selected_kind == '文字' and mode == '自动选择':
+            # Auto mode behaves like Adobe: one click picks the whole cell/block.
+            self.selected_paragraph = self.text_block_lines(page_lines, self.selected_line, page)
+            if not self.selected_paragraph:
+                self.selected_paragraph = text_edit.paragraph_at(full_text_lines(page), self.selected_line)
+            if self.selected_paragraph:
+                self.selection = fitz.Rect(self.selected_paragraph[0]['bbox'])
+                for line in self.selected_paragraph[1:]:
+                    self.selection |= fitz.Rect(line['bbox'])
+                self.status.config(text=f'已选中整块文字（{len(self.selected_paragraph)} 行），拖动移动，双击整段编辑。')
+        if self.selected_kind == '文字' and mode == '选择文本框':
             self.selected_paragraph = text_edit.paragraph_at(full_text_lines(page), self.selected_line)
             if self.selected_paragraph:
                 for line in self.selected_paragraph:
@@ -3238,10 +3334,19 @@ class PDFTool:
             elif kind == '文字' and was_box:
                 self.select_object((target.tl+target.br)/2)
             elif kind == '文字':
-                moved = [ln for r, ln in full_text_lines(self.doc[self.page_index])
-                         if target.contains(fitz.Point((r.x0+r.x1)/2, (r.y0+r.y1)/2))
-                         and abs(r.x0-(old.x0+dx)) < 3]
+                # Identify the moved lines by their own text and shifted baseline:
+                # overlapping blocks share left edges, so geometry alone picks up
+                # lines belonging to the block underneath.
+                expected = [(fitz.Rect(ln['bbox']) + (dx, dy, dx, dy), text_edit.line_text(ln)) for ln in lines]
+                moved = []
+                for shifted, label in expected:
+                    for rect, candidate in full_text_lines(self.doc[self.page_index]):
+                        if abs(rect.y0 - shifted.y0) <= 2.5 and abs(rect.x0 - shifted.x0) <= 3 \
+                                and text_edit.line_text(candidate) == label:
+                            moved.append(candidate)
+                            break
                 if moved:
+                    self.remember_moved_text(self.page_index, expected)
                     self.selected_paragraph = moved
                     self.selected_line = moved[0]
                     self.selection = fitz.Rect(moved[0]['bbox'])
@@ -3360,6 +3465,9 @@ class PDFTool:
                 chosen.append(candidate)
                 changed = True
                 break
+        # Keep top-to-bottom order: the discovery loop can append lines out of order
+        # and the editor would then write them back in the wrong order.
+        chosen.sort(key=lambda item: (round(fitz.Rect(item['bbox']).y0, 1), fitz.Rect(item['bbox']).x0))
         return chosen
     def area_lines_partial(self, page, rect):
         """Text lines whose centre falls inside the box, even when they stick out.
@@ -4224,6 +4332,10 @@ class PDFTool:
         if self.inline_editor or not self.selected_line or not self.selection:
             return
         lines = self.selected_paragraph or [self.selected_line]
+        # Any multi-line pick must be edited as a group; the single-line path joins
+        # the lines with spaces and would destroy the block on write-back.
+        if not explicit_group and not self.selected_block and len(lines) > 1:
+            explicit_group = True
         if explicit_group:
             pieces = text_styles.read_lines(self.doc[self.page_index], lines)
             old = '\n'.join(part.text for part in pieces)
@@ -4353,6 +4465,17 @@ class PDFTool:
         try:
             page = self.doc[state['page']]
             keys, runs = self.inline_runs(text)
+            # Never write a paragraph back in a different order than it was read.
+            if len(state.get('lines') or []) > 1:
+                state['lines'] = sorted(state['lines'],
+                                        key=lambda item: (round(fitz.Rect(item['bbox']).y0, 1),
+                                                          fitz.Rect(item['bbox']).x0))
+            para_wrap = None
+            if len(state.get('lines') or []) > 1:
+                block_rect = fitz.Rect(state['lines'][0]['bbox'])
+                for item in state['lines'][1:]:
+                    block_rect |= fitz.Rect(item['bbox'])
+                para_wrap = max(block_rect.width + 12, page.rect.x1 - block_rect.x0 - 4)
             if state.get('kind') == 'new':
                 size = state['base_style'].size
                 rect = state['rect']
@@ -4366,8 +4489,11 @@ class PDFTool:
                 text_edit._remove_lines(page, state['lines'], decor=state.get('decor', ()))
                 if text:
                     rect, origin = state['rect'], state['origin']
+                    # Wrap at the block width plus slack: using the exact box width
+                    # wrapped a long line into two as soon as one character was added.
+                    wrap = max(2, min(rect.x1 - origin.x + 16, page.rect.x1 - origin.x - 2))
                     added_text.write(page, origin, 0, resolved_text, resolved_keys, state['step'],
-                                     max(2, rect.x1-origin.x), fonts=fonts, box=rect)
+                                     wrap, fonts=fonts, box=rect)
             elif state.get('block'):
                 block = state['block']
                 styled, _ = added_text.contents(page, block)
@@ -4375,9 +4501,13 @@ class PDFTool:
                                    styled=styled, box=block.props['box'])
             elif state.get('format_changed') or len(set(keys)) > 1:
                 styled = text_styles.read_paragraph(page, state['lines'])
-                text_edit.replace_paragraph(page, state['lines'], text, runs=runs, decor=styled.decor)
+                text_edit.replace_paragraph(page, state['lines'], text, runs=runs,
+                                            decor=styled.decor, wrap_width=para_wrap)
             elif len(state['lines']) > 1:
-                text_edit.replace_paragraph(page, state['lines'], text)
+                # Write the whole paragraph in reading order; the engine keeps the
+                # line breaks. Wrap at the page edge (not at the original box width),
+                # otherwise adding one character wraps a long line into two.
+                text_edit.replace_paragraph(page, state['lines'], text, wrap_width=para_wrap)
             else:
                 # Keep the edited line inside the page: without a wrap width a long
                 # insertion becomes one line that runs off the paper.
@@ -4433,25 +4563,59 @@ class PDFTool:
         ttk.Button(buttons, text='确定', command=apply).pack(side='left', padx=5)
         ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='left', padx=5)
 
+    def _finish_editing_for_history(self):
+        """Apply or drop an open inline editor; never block undo with a dialog."""
+        if self.inline_editor is None:
+            return True
+        try:
+            if not self.inline_editor.winfo_exists():
+                self.inline_editor = None
+                return True
+            return bool(self.apply_inline())
+        except tk.TclError:
+            self.inline_editor = None
+            return True
+        except Exception:
+            self.inline_editor = None
+            return True
+
     def undo(self):
-        if self.inline_editor and not self.apply_inline(): return
-        if not self.undo_data: return
-        self.redo_data.append((self.doc.tobytes(garbage=0, deflate=True), self.dirty, self.page_index))
-        data, self.dirty, self.page_index = self.undo_data.pop()
-        self.dirty = True
-        self.doc.close()
-        self.doc = fitz.open(stream=data, filetype='pdf')
-        self.show()
+        if not self._finish_editing_for_history():
+            return
+        if not self.undo_data:
+            self.status.config(text='没有可撤销的操作。')
+            return
+        try:
+            self.redo_data.append((self.doc.tobytes(garbage=0, deflate=True), self.dirty, self.page_index))
+            data, self.dirty, self.page_index = self.undo_data.pop()
+            self.dirty = True
+            self.moved_text_marks = []
+            self.doc.close()
+            self.doc = fitz.open(stream=data, filetype='pdf')
+            self.show()
+            self.canvas.focus_set()
+            self.status.config(text=f'已撤销（还可撤销 {len(self.undo_data)} 步）。')
+        except Exception as exc:
+            self.status.config(text=f'撤销失败：{exc}')
 
     def redo(self):
-        if self.inline_editor and not self.apply_inline(): return
-        if not self.redo_data: return
-        self.undo_data.append((self.doc.tobytes(garbage=0, deflate=True), self.dirty, self.page_index))
-        data, self.dirty, self.page_index = self.redo_data.pop()
-        self.dirty = True
-        self.doc.close()
-        self.doc = fitz.open(stream=data, filetype='pdf')
-        self.show()
+        if not self._finish_editing_for_history():
+            return
+        if not self.redo_data:
+            self.status.config(text='没有可重做的操作。')
+            return
+        try:
+            self.undo_data.append((self.doc.tobytes(garbage=0, deflate=True), self.dirty, self.page_index))
+            data, self.dirty, self.page_index = self.redo_data.pop()
+            self.dirty = True
+            self.moved_text_marks = []
+            self.doc.close()
+            self.doc = fitz.open(stream=data, filetype='pdf')
+            self.show()
+            self.canvas.focus_set()
+            self.status.config(text=f'已重做（还可重做 {len(self.redo_data)} 步）。')
+        except Exception as exc:
+            self.status.config(text=f'重做失败：{exc}')
 
     def selected_rect(self):
         if self.inline_editor:

@@ -41,6 +41,8 @@ $arguments = @(
     '--hidden-import', 'printing',
     '--hidden-import', 'win32timezone',
     '--hidden-import', 'tkinterdnd2',
+    '--hidden-import', 'updater',
+    '--hidden-import', 'pdf_association',
     '--add-data', "$iconData;.",
     '--distpath', $distDir,
     '--workpath', $buildDir,
