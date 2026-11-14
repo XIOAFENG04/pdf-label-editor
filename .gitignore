@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artefacts (published separately as Release assets)
+outputs/可执行版*/
+outputs/安装包/
+outputs/*.exe
+work/exe-build*/
+work/exe-debug/
+work/pyinstaller-build/
+work/installer/build/
+work/installer/dist/
+work/installer/spec/
+work/installer/payload/
+work/debug-dist/
+work/preview-compare/
+work/icon-repair/
+work/kanzonaspdf/
+work/kanzonas-source/
+work/kanzonas-integrate/
+work/barcode-test-deps/
+work/draw-check/
+work/pdfme-reference/
+
+# Vendored runtime dependencies of the frozen build
+outputs/PDF小工具/依赖/
+
+# Keep only maintainer scripts and assets inside work/
+work/*
+!work/*.ps1
+!work/*.md
+!work/assets/
+!work/installer/
+!work/installer/installer.py
+
+# Working data
+work/samples/
+work/tmp*/
+work/*.log
+work/*.sqlite3
+work/ui-review.png
+*.sqlite3
+*.db

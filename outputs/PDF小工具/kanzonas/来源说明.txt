@@ -1,0 +1,3 @@
+本工具的 kanzonas 文件夹包含 KanzonasPDF v1.14 的文字编辑相关开源代码。
+原项目：https://github.com/keithlyding/KanzonasPDF/tree/v1.14
+许可证：GNU AGPL-3.0，见 LICENSE-AGPL-3.0.txt；其他组件许可见 NOTICE.txt。
