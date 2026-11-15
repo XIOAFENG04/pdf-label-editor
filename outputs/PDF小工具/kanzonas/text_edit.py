@@ -598,8 +598,7 @@ def _rgb(color_int):
 
 def _split_long(cur, font, size, width, out):
     """Append the fitting prefixes of an over-wide token to out and keep the rest."""
-    limit = width + max(1.0, 0.02*width) if width > 0 else width
-    while width > 0 and len(cur) > 1 and font.text_length(cur, fontsize=size) > limit:
+    while width > 0 and len(cur) > 1 and font.text_length(cur, fontsize=size) > width+0.01:
         k = len(cur) - 1
         while k > 1 and font.text_length(cur[:k], fontsize=size) > width:
             k -= 1
@@ -703,13 +702,14 @@ def _broad_font(page, text):
 
 
 def _fix_spaces(page, fontname, font):
-    """Many fonts (Times New Roman, Arial on Windows...) draw a space and a no-break space with
-    the same glyph, and the text map PyMuPDF writes for an embedded font then names that
-    glyph a no-break space (U+00A0): search, copy and paste would see it instead of a normal
-    space. Point the space glyph back at U+0020."""
+    """Give shared space and hyphen glyphs their usual codes on copy and search."""
     try:
-        gid = font.has_glyph(0x20)
-        if not gid or font.has_glyph(0xA0) != gid:
+        aliases = []
+        for char, alternate in ((0x20, 0xa0), (0x2d, 0xad)):
+            gid = font.has_glyph(char)
+            if gid and font.has_glyph(alternate) == gid:
+                aliases.append((gid, alternate, char))
+        if not aliases:
             return
         doc = page.parent
         for f in page.get_fonts(full=True):
@@ -720,9 +720,11 @@ def _fix_spaces(page, fontname, font):
                 continue
             tu = int(val.split()[0])
             data = doc.xref_stream(tu)
-            for hexgid in (b"%04x" % gid, b"%04X" % gid):
-                for nb in (b"<00a0>", b"<00A0>"):
-                    data = data.replace(b"<" + hexgid + b"> " + nb, b"<" + hexgid + b"> <0020>")
+            for gid, alternate, char in aliases:
+                for hexgid in (b"%04x" % gid, b"%04X" % gid):
+                    prefix = b"<" + hexgid + b"> "
+                    for other in (b"<%04x>" % alternate, b"<%04X>" % alternate):
+                        data = data.replace(prefix + other, prefix + (b"<%04x>" % char))
             doc.update_stream(tu, data)
     except Exception:
         pass        # the text is written either way; only search / copy would be affected
@@ -1881,6 +1883,14 @@ def mixed_styles(line):
             return True
         seen.add((s["font"], round(s["size"], 1), s["color"], s["flags"] & (_ITALIC | _BOLD)))
     return len(seen) > 1
+
+
+def plain_line_row_count(page, line, text, width):
+    """Measure a plain replacement using the same font as replace_line."""
+    main = main_span(line)
+    found, text = _font_for(page, main, text)
+    font = found[1] if found else pymupdf.Font(_base14(main))
+    return len(_wrap(text, font, float(main["size"]), width))
 
 
 def replace_line(page, line, new_text, offset=(0, 0), wrap_width=None, font=None, size=None,

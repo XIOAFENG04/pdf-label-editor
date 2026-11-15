@@ -831,7 +831,7 @@ def wrap(chars, fonts, width=None, indent=0.0):
                 out.append(cur)
                 cur, cur_w = [], 0.0
             if not cur:
-                if 0 < room and ww > room + max(1.0, 0.02*room):
+                if 0 < room and ww > room+0.01:
                     # A single token wider than the line (long numbers, URLs) used to
                     # run past the box; break it at character boundaries instead.
                     chunk, chunk_w = [], 0.0

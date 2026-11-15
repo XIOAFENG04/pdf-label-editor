@@ -63,7 +63,8 @@ class RoundButton(tk.Canvas):
         self.bind('<FocusOut>', lambda e:self.set_state('focused', False))
         self.bind('<ButtonPress-1>', self.on_press)
         self.bind('<ButtonRelease-1>', self.on_release)
-        self.bind('<space>', self.on_key)
+        # Space is reserved for grab-and-drag panning, so only Enter activates
+        # a toolbar button from the keyboard.
         self.bind('<Return>', self.on_key)
         self.paint()
 
@@ -353,6 +354,7 @@ class PDFTool:
         self.selection = None
         self.selection_lines = []
         self.moved_text_marks = []
+        self.space_pan = False
         self.drag_start = None
         self.drag_kind = None
         self.drag_origin_rect = None
@@ -506,10 +508,26 @@ class PDFTool:
             tabs = self.tab_control.tabs()
             if not tabs or index >= len(tabs):
                 return None
-            box = self.tab_control.bbox(index)
-            if not box:
+            # ttk.Notebook.bbox() returns (0,0,0,0) for tabs on Windows.
+            # Find this tab's actual right edge with Tk's own hit testing.
+            if self.tab_control.identify(event.x, event.y) != 'label':
                 return None
-            if event.x >= box[0] + box[2] - 18:
+            right = event.x
+            while right + 1 < self.tab_control.winfo_width():
+                try: next_index = self.tab_control.index('@%d,%d' % (right+1, event.y))
+                except tk.TclError: break
+                if next_index != index: break
+                right += 1
+            padding = ttk.Style().lookup('Document.TNotebook.Tab', 'padding')
+            try:
+                parts = self.root.tk.splitlist(padding)
+                pad_right = int(str(parts[2] if len(parts) >= 3 else parts[0])) if parts else 0
+            except (ValueError, tk.TclError): pad_right = 0
+            from tkinter import font as tkfont
+            font_spec = ttk.Style().lookup('Document.TNotebook.Tab', 'font')
+            glyph_width = tkfont.Font(root=self.root, font=font_spec).measure('×')
+            glyph_right = right - pad_right + 2
+            if glyph_right-glyph_width-3 <= event.x <= glyph_right:
                 self.close_tab_by(tabs[index])
                 return 'break'
             return None
@@ -673,6 +691,8 @@ class PDFTool:
         self.canvas.bind('<MouseWheel>', self.mouse_wheel)
         self.canvas.bind('<Shift-MouseWheel>', self.horizontal_wheel)
         self.canvas.bind('<Control-MouseWheel>', self.zoom_wheel)
+        self.root.bind('<KeyPress-space>', self.begin_space_pan)
+        self.root.bind('<KeyRelease-space>', self.end_space_pan)
         self.canvas.bind('<ButtonPress-2>', lambda e: self.canvas.scan_mark(e.x, e.y))
         self.canvas.bind('<B2-Motion>', lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
         self.canvas.bind('<Configure>', self.resized)
@@ -686,6 +706,7 @@ class PDFTool:
             self.root.bind(event, lambda e, fn=action: self.shortcut(e, fn))
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.root.bind('<Delete>', lambda event: self.shortcut(event, self.delete_selected))
+        self.root.bind('<BackSpace>', lambda event: self.shortcut(event, self.delete_selected))
         self.root.bind('<Control-w>', lambda event: self.shortcut(event, self.close_tab))
         self.load_assets()
         self.remote_paths = None
@@ -2325,8 +2346,12 @@ class PDFTool:
                 for path in self.remote_paths.get_nowait():
                     self.open_path(path)
                 self.root.deiconify()
+                # A file dropped on the desktop shortcut launches another
+                # process, so Windows may deny a normal focus request.
+                self.root.attributes('-topmost', True)
                 self.root.lift()
                 self.root.focus_force()
+                self.root.after(250, lambda: self.root.attributes('-topmost', False) if self.root.winfo_exists() else None)
         except queue.Empty:
             pass
         self.root.after(400, self.poll_remote_paths)
@@ -2335,15 +2360,23 @@ class PDFTool:
         if getattr(self, 'closing', False):
             return
         self.closing = True
-        self.save_window_state()
-        if self.inline_editor and not self.apply_inline(): return
-        while self.tabs:
-            if not self.close_tab(): return
-        if self.doc: self.doc.close(); self.doc = None
-        if self.asset_db:
-            self.asset_db.close()
-            self.asset_db = None
-        self.root.destroy()
+        try:
+            self.save_window_state()
+            if self.inline_editor and not self.apply_inline(): return
+            while self.tabs:
+                if self.active_tab not in self.tabs:
+                    self.activate_tab(next(iter(self.tabs)))
+                before = len(self.tabs)
+                if not self.close_tab(): return
+                if len(self.tabs) >= before:
+                    raise RuntimeError('无法关闭 PDF 标签，请重试。')
+            if self.doc: self.doc.close(); self.doc = None
+            if self.asset_db:
+                self.asset_db.close()
+                self.asset_db = None
+            self.root.destroy()
+        finally:
+            self.closing = False
 
     def open(self):
         if self.inline_editor and not self.apply_inline(): return
@@ -2459,8 +2492,14 @@ class PDFTool:
         if not tab or tab not in self.tabs:
             return False
         if self.active_tab != tab:
-            self.tab_control.select(tab)
-            self.activate_tab(tab)
+            if self.inline_editor and not self.apply_inline(): return False
+            self.store_tab()
+            self.changing_tab = True
+            try:
+                self.tab_control.select(tab)
+                self.activate_tab(tab)
+            finally:
+                self.changing_tab = False
         return self.close_tab()
 
     def view_anchor(self, screen_x=None, screen_y=None):
@@ -2505,7 +2544,12 @@ class PDFTool:
             self.canvas.create_rectangle(x+5, y+6, x+photo.width()+5, y+photo.height()+6,
                                          fill=theme.c('shadow'), outline='', tags=('page-shadow', f'page-shadow-{i}'))
             self.canvas.create_image(x, y, image=photo, anchor='nw', tags=('pdf-page', f'pdf-page-{i}'))
-            self.canvas.tag_lower(f'page-shadow-{i}')
+            self.canvas.tag_lower(f'pdf-page-{i}')
+            self.canvas.tag_lower(f'page-shadow-{i}', f'pdf-page-{i}')
+        if self.inline_editor and self.inline_state:
+            self.canvas.tag_raise('inline-editor')
+            self.inline_state['frame'].lift()
+            self.draw_inline_box()
         if change_page and not self.inline_editor and self.drag_start is None:
             center = top+height/2
             index = min(range(len(self.page_layout)), key=lambda i: abs(center-(self.page_layout[i][1]+self.page_layout[i][3]/2)))
@@ -2683,10 +2727,22 @@ class PDFTool:
             prior = fitz.Rect(self.selection) if self.selection else None
             point = fitz.Point((x-self.origin_x)/self.scale, (y-self.origin_y)/self.scale)
             if not self.apply_inline(): return
+            x, y = self.origin_x+point.x*self.scale, self.origin_y+point.y*self.scale
             if prior and (prior + (-45/self.scale,-45/self.scale,45/self.scale,45/self.scale)).contains(point):
                 self.select_object((prior.tl+prior.br)/2)
+        if self.space_pan:
+            # Space held: grab and drag anywhere on the workspace, page or margin.
+            self.drag_start = (x, y)
+            self.drag_kind = 'pan'
+            self.canvas.scan_mark(event.x, event.y)
+            return
         page = self.page_at_canvas_point(x, y)
-        if page is None: return
+        if page is None:
+            if not self.placing_text:
+                self.drag_start = (x, y)
+                self.drag_kind = 'outside_select'
+                self.canvas.delete('selection')
+            return
         if page != self.page_index: self.activate_canvas_page(page)
         self.drag_start = (x, y)
         point = fitz.Point((x-self.origin_x)/self.scale, (y-self.origin_y)/self.scale)
@@ -2734,6 +2790,9 @@ class PDFTool:
 
     def drag(self, event):
         if self.drag_start is None: return
+        if self.drag_kind == 'pan':
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+            return
         self.canvas.delete('selection')
         self.canvas.delete('snap-guide')
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
@@ -2772,6 +2831,11 @@ class PDFTool:
 
     def release(self, event):
         if self.drag_start is None: return
+        if self.drag_kind == 'pan':
+            self.drag_kind = None
+            self.drag_start = None
+            self.canvas.config(cursor='hand2' if self.space_pan else '')
+            return
         self.canvas.delete('snap-guide')
         x0,y0 = self.drag_start
         x1,y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
@@ -2783,6 +2847,23 @@ class PDFTool:
             else: self.draw_selection(self.selection)
             return
         self.drag_start = None
+        if self.drag_kind == 'outside_select':
+            self.drag_kind = None
+            self.canvas.delete('selection')
+            if abs(x1-x0) < 5 or abs(y1-y0) < 5:
+                return
+            area = fitz.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            overlaps = []
+            for index, (left, top, width, height) in enumerate(self.page_layout):
+                overlap = area & fitz.Rect(left, top, left+width, top+height)
+                if not overlap.is_empty:
+                    overlaps.append((overlap.get_area(), index, overlap))
+            if not overlaps:
+                return
+            _, page, overlap = max(overlaps, key=lambda item: (item[0], item[1] == self.page_index))
+            if page != self.page_index:
+                self.activate_canvas_page(page)
+            x0, y0, x1, y1 = overlap
         if self.drag_kind == 'new_text':
             self.drag_kind = None
             self.placing_text = False
@@ -3304,7 +3385,7 @@ class PDFTool:
             return
         # Overlapping text: repeated clicks on the same spot cycle through the
         # candidates, so a block moved on top of another stays reachable.
-        candidates.sort(key=lambda item: item[0].get_area())
+        candidates.sort(key=lambda item: (self.rect_distance(item[0], point), item[0].get_area()))
         spot = (round(point.x, 1), round(point.y, 1))
         ids = [id(item[2]) for item in candidates]
         cycle = getattr(self, '_click_cycle', None)
@@ -3363,13 +3444,7 @@ class PDFTool:
             if self.selected_kind == '文字':
                 lines = self.selected_paragraph or [self.selected_line]
                 if self.selected_block:
-                    if any(not page.rect.contains(fitz.Rect(line['bbox'])) for line in lines):
-                        raise ValueError('文本已有部分在页面外，暂不能安全移动；请使用撤销恢复。')
-                    styled, _ = added_text.contents(page, self.selected_block)
-                    box = self.selected_block.props['box'] + (dx,dy,dx,dy)
-                    added_text.rewrite(page, self.selected_block, styled.text,
-                        text_styles.runs_of(styled.text, styled.keys), box.width,
-                        offset=(dx, dy), styled=styled, box=box)
+                    self.move_text_without_clipping(page, lines, (dx, dy), self.selected_block)
                 else:
                     self.move_text_without_clipping(page, lines, (dx, dy))
             elif self.selected_kind in ('图片', '图形'):
@@ -3388,7 +3463,9 @@ class PDFTool:
             if kind in ('图片', '图形') and self.reselect_graphic(target, kind):
                 pass
             elif kind == '文字' and was_box:
-                self.select_object((target.tl+target.br)/2)
+                visible = target & self.doc[self.page_index].rect
+                if not visible.is_empty:
+                    self.select_object((visible.tl+visible.br)/2)
             elif kind == '文字':
                 # Identify the moved lines by their own text and shifted baseline:
                 # overlapping blocks share left edges, so geometry alone picks up
@@ -3431,12 +3508,19 @@ class PDFTool:
             self.doc.close(); self.doc = fitz.open(stream=original, filetype='pdf'); self.show()
             messagebox.showerror('移动失败', str(exc))
 
-    def move_text_without_clipping(self, page, lines, offset):
+    def move_text_without_clipping(self, page, lines, offset, block=None):
         """Expand page bounds during text removal so off-page glyphs are not lost."""
         bounds = fitz.Rect()
         for line in lines: bounds |= fitz.Rect(line['bbox'])
         if page.rect.contains(bounds):
-            text_edit.move_lines(page, lines, offset)
+            if block:
+                styled, _ = added_text.contents(page, block)
+                box = block.props['box'] + (*offset, *offset)
+                added_text.rewrite(page, block, styled.text,
+                    text_styles.runs_of(styled.text, styled.keys), box.width,
+                    offset=offset, styled=styled, box=box)
+            else:
+                text_edit.move_lines(page, lines, offset)
             return
         doc, index = page.parent, page.number
         original_rect = fitz.Rect(page.rect)
@@ -3450,6 +3534,22 @@ class PDFTool:
         try:
             page.set_mediabox(expanded)
             new_matrix = fitz.Matrix(page.transformation_matrix)
+            shift = fitz.Point(0, 0) * ~old_matrix * new_matrix
+            def translate_markers(delta):
+                by_stream = {}
+                for marker in added_text.markers(page):
+                    by_stream.setdefault(marker['xref'], []).append(marker)
+                for xref, markers in by_stream.items():
+                    data = doc.xref_stream(xref)
+                    for marker in reversed(markers):
+                        props = marker['props']
+                        props['origin'] += delta
+                        if props.get('box'):
+                            props['box'] += (delta.x, delta.y, delta.x, delta.y)
+                        start, end = marker['bdc']
+                        data = data[:start] + added_text.marker(props) + data[end:]
+                    doc.update_stream(xref, data)
+            translate_markers(shift)
             candidates = full_text_lines(page)
             mapped = []
             for line in lines:
@@ -3463,9 +3563,23 @@ class PDFTool:
                 if not options: raise ValueError('无法完整定位页面外的文字，未进行移动。')
                 chosen = min(options, key=lambda item:item[0].get_area())[1]
                 mapped.append(chosen)
-            text_edit.move_lines(page, mapped, offset)
+            if block:
+                origin = fitz.Point(block.props['origin']) * ~old_matrix * new_matrix
+                choices = added_text.find(page, candidates)
+                mapped_block = min(choices, key=lambda item: abs(fitz.Point(item.props['origin'])-origin), default=None)
+                if not mapped_block or abs(fitz.Point(mapped_block.props['origin'])-origin) > 2:
+                    raise ValueError('无法完整定位页面外的文本框，未进行移动。')
+                styled, _ = added_text.contents(page, mapped_block)
+                box = mapped_block.props['box'] + (*offset, *offset)
+                added_text.rewrite(page, mapped_block, styled.text,
+                    text_styles.runs_of(styled.text, styled.keys), box.width,
+                    offset=offset, styled=styled, box=box)
+            else:
+                text_edit.move_lines(page, mapped, offset)
         finally:
             xref = page.xref
+            if 'new_matrix' in locals():
+                translate_markers(-shift)
             page.set_mediabox(original_media)
             if page.cropbox != original_crop:
                 page.set_cropbox(original_crop)
@@ -3481,7 +3595,10 @@ class PDFTool:
         selected = [item for item in objects.items
                     if rect.contains(fitz.Rect(item['rect']))
                     and fitz.Rect(item['rect']).width >= .5 and fitz.Rect(item['rect']).height >= .5]
-        text = [(bounds, line) for bounds, line in full_text_lines(page) if rect.contains(bounds)]
+        # Page-edge clipping must not exclude a line whose visible portion was
+        # fully selected, even when its PDF glyph bounds extend off the page.
+        text = [(bounds, line) for bounds, line in full_text_lines(page)
+                if not (bounds & page.rect).is_empty and rect.contains(bounds & page.rect)]
         groups = [fitz.Rect(item['rect']) for item in selected if item.get('kind') == 'group']
         if any(group.intersects(bounds) for group in groups for bounds, line in text):
             raise ValueError('框内的组合对象与文字重叠，暂不能安全整体处理。请在“选择图片”模式下单独选择该对象。')
@@ -3993,13 +4110,24 @@ class PDFTool:
         if any(a.type[0] == fitz.PDF_ANNOT_REDACT for a in (page.annots() or [])):
             messagebox.showerror('暂不能编辑', '此页存在未应用的涂黑批注，请先处理这些批注。')
             return
-        if not messagebox.askyesno('删除框选内容', '删除区域内的文字、图片和图形？\n碰到区域的整条线或图形可能会一并删除，可以使用“撤销”恢复。'):
+        if not messagebox.askyesno('删除框选内容', '删除框内完整包含的文字、图片和图形？\n部分碰到的内容会保留。'):
             return
         original = self.doc.tobytes(garbage=0, deflate=True)
         previous_dirty = self.dirty
         try:
-            page.add_redact_annot(self.selection, fill=False, cross_out=False)
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
+            area = fitz.Rect(self.selection)
+            objects = page_objects.Objects(page)
+            numbers = [item['n'] for item in objects.items
+                       if area.contains(fitz.Rect(item['rect']))]
+            lines = [line for bounds, line in full_text_lines(page) if area.contains(bounds)]
+            if not numbers and not lines:
+                messagebox.showinfo('删除框选内容', '框内没有完整包含的内容，请调整框选范围。')
+                return
+            if numbers:
+                page_objects.delete(page, numbers, objects)
+            if lines:
+                text_edit.refuse_with_marks(page)
+                text_edit._remove_lines(page, lines)
             self.commit(original, previous_dirty)
         except Exception as exc:
             self.doc.close()
@@ -4161,8 +4289,10 @@ class PDFTool:
         name = 'fmt_' + str(len(tags))
         tags[name] = style
         color = '#%06x' % (style.color & 0xffffff)
+        family = self.tk_family(style.family or style.font)
+        display_scale = state.get('display_font_scale', 1.0)
         editor.tag_configure(name, foreground=color,
-            font=('Arial', -max(1,round(style.size*self.scale)),
+            font=(family, -max(1,round(style.size*self.scale*display_scale)),
                   'bold' if style.bold else 'normal', 'italic' if style.italic else 'roman'))
         editor.tag_raise('sel')
         return name
@@ -4276,6 +4406,10 @@ class PDFTool:
         raw = (name or '').split('+')[-1].split(',')[0].strip()
         families = {item.lower(): item for item in tkfont.families()}
         candidates = [raw]
+        aliases = {'simhei': '黑体', 'simsun': '宋体', 'fangsong': '仿宋',
+                   'kaiti': '楷体', 'microsoftyahei': 'Microsoft YaHei'}
+        alias = aliases.get(raw.lower().replace(' ', '').replace('-', ''))
+        if alias: candidates.insert(0, alias)
         if raw.lower().endswith('mt'): candidates.append(raw[:-2])
         candidates.append(raw.split('-')[0])
         for candidate in candidates:
@@ -4286,28 +4420,89 @@ class PDFTool:
                 return display
         return 'Arial'
 
+    def begin_space_pan(self, event=None):
+        """Hold Space to grab the page and drag it, like Adobe/Photoshop."""
+        if self.inline_editor is not None:
+            return
+        if event is not None and isinstance(event.widget, (tk.Text, tk.Entry, ttk.Entry, ttk.Combobox)):
+            return
+        self.space_pan = True
+        self.canvas.config(cursor='hand2')
+        return 'break'
+
+    def end_space_pan(self, event=None):
+        self.space_pan = False
+        if self.drag_kind != 'pan':
+            self.canvas.config(cursor='')
+
+    def draw_inline_box(self):
+        """Keep a visible frame around the text being edited."""
+        state = self.inline_state
+        if not state or 'window' not in state:
+            return
+        self.canvas.delete('inline-box')
+        coords = self.canvas.coords(state['window'])
+        if len(coords) < 2:
+            return
+        # Take the canvas window's actual pixel bounds. Its native child is
+        # always above canvas items, so draw the dashes outside that window.
+        left, top, right, bottom = self.canvas.bbox(state['window'])
+        self.canvas.create_rectangle(left-1, top-1, right+1, bottom+1,
+                                     outline='#0056b3', width=1, dash=(5, 3), tags='inline-box')
+        self.canvas.tag_raise('inline-editor')
+        state['frame'].lift()
+
+    def fit_editor_font_size(self, sample, line_rect, family, guess):
+        """Pick the pixel size whose rendered width best matches the page line.
+
+        The editor draws the same words with a system font; if that font is a pixel
+        wider or narrower than the PDF's, the overlay text slides away from the page
+        text and the caret looks misplaced. Matching the measured width keeps the
+        editor on top of the original letters.
+        """
+        from tkinter import font as tkfont
+        if not sample or line_rect is None or line_rect.width <= 0:
+            return guess
+        target = line_rect.width * self.scale
+        best, best_error = guess, None
+        for size in range(max(6, guess - 4), guess + 5):
+            try:
+                width = tkfont.Font(family=family, size=-size).measure(sample)
+            except tk.TclError:
+                continue
+            error = abs(width - target)
+            if best_error is None or error < best_error:
+                best, best_error = size, error
+        return best
+
     def create_inline_widget(self, rect, font_size, wrap, family='Arial', color='#000000'):
-        # No border and no highlight: the editor sits exactly on the page text with
-        # the same family, size and colour, so typing looks like editing the page
-        # itself instead of typing into a white box.
         frame = tk.Frame(self.canvas, borderwidth=0, highlightthickness=0)
         editor = tk.Text(frame, wrap=wrap, undo=True, font=(family, -max(1, font_size)),
-                         background='white', foreground=color, insertbackground=color,
+                         background='white', foreground=color, insertbackground='#0056b3',
+                         selectbackground='#176bc0', selectforeground='#ffffff',
                          borderwidth=0, relief='flat', padx=1, pady=0,
                          highlightthickness=0, exportselection=False)
         editor.bind('<<Copy>>', self.capture_inline_copy, add='+')
         vbar = SlimScrollbar(frame, orient='vertical', command=editor.yview)
-        hbar = SlimScrollbar(frame, orient='horizontal', command=editor.xview)
-        editor.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        editor.configure(yscrollcommand=vbar.set)
         frame.grid_rowconfigure(0, weight=1)
         frame.grid_columnconfigure(0, weight=1)
         editor.grid(row=0, column=0, sticky='nsew')
         width = max(24, round(rect.width*self.scale)+2)
         height = max(font_size+4, round(rect.height*self.scale)+2)
-        window = self.canvas.create_window(self.origin_x+rect.x0*self.scale, self.origin_y+rect.y0*self.scale,
-            anchor='nw', window=frame, width=width, height=height, tags='inline-editor')
-        return editor, {'frame':frame, 'window':window, 'vbar':vbar, 'hbar':hbar,
+        left, top, right, bottom = self.inline_page_bounds(self.page_index)
+        x = min(right-1, max(left, round(self.origin_x+rect.x0*self.scale)))
+        y = min(bottom-1, max(top, round(self.origin_y+rect.y0*self.scale)))
+        window = self.canvas.create_window(x, y, anchor='nw', window=frame,
+            width=min(width, right-x), height=min(height, bottom-y), state='hidden', tags='inline-editor')
+        return editor, {'frame':frame, 'window':window, 'vbar':vbar,
                         'base_width':width, 'base_height':height, 'wrap':wrap}
+
+    def inline_page_bounds(self, page):
+        x, y, w, h = self.page_layout[page]
+        # Leave room for the dashed stroke so it doesn't spill into the margin.
+        left, top = round(x)+2, round(y)+2
+        return left, top, max(left+1, round(x)+w-2), max(top+1, round(y)+h-2)
 
     def schedule_inline_layout(self, event=None):
         if not self.inline_editor or not self.inline_state: return
@@ -4321,53 +4516,75 @@ class PDFTool:
         editor, state = self.inline_editor, self.inline_state
         state['layout_job'] = None
         try:
-            from tkinter import font as tkfont
-            view_width = self.canvas.winfo_width()
-            view_height = self.canvas.winfo_height()
-            max_width = max(state['base_width'], int(view_width*.85) if view_width > 100 else 800)
-            if state['wrap'] == 'none' and view_width > 100:
-                left = self.canvas.coords(state['window'])[0] - self.canvas.canvasx(0)
-                max_width = max(80, min(max_width, view_width-left-15))
-            max_height = max(55, int(view_height*.70)) if view_height > 100 else 600
-            width = state['base_width']
-            need_hbar = False
-            if state['wrap'] == 'none':
-                ruler = tkfont.Font(font=editor.cget('font'))
-                lines = editor.get('1.0','end-1c').split('\n')
-                desired = max((ruler.measure(line) for line in lines), default=0)+18
-                width = min(max_width,max(width,desired))
-                need_hbar = desired > max_width
-            state['hbar'].grid(row=1,column=0,sticky='ew') if need_hbar else state['hbar'].grid_remove()
-            self.canvas.itemconfigure(state['window'], width=width)
-            editor.update_idletasks()
-            count = editor.count('1.0','end','ypixels')
-            wanted = (count[0] if count else 0) + 8 + (18 if need_hbar else 0)
-            height = min(max_height,max(state['base_height'],wanted))
-            if wanted > max_height:
-                state['vbar'].grid(row=0,column=1,sticky='ns')
+            left, top, right, bottom = self.inline_page_bounds(state['page'])
+            preview = state.get('original_view')
+            value = editor.get('1.0', 'end-1c')
+            unchanged = value == state['old'] and not state.get('format_changed')
+            if not unchanged:
+                for tag in editor.tag_names():
+                    if tag.startswith('pdf_line_spacing_'):
+                        editor.tag_remove(tag, '1.0', 'end')
+            draft = self.inline_draft_preview(value) if preview is not None and not unchanged else None
+            show_pdf = preview is not None and (unchanged or draft is not None)
+            x, y = state.get('original_position' if show_pdf else 'input_position',
+                             self.canvas.coords(state['window']))
+            x, y = min(right-1, max(left, round(x))), min(bottom-1, max(top, round(y)))
+            self.canvas.coords(state['window'], x, y)
+            max_width, max_height = right-x, bottom-y
+            width = min(max_width, state['base_width'])
+            height = min(max_height, state['base_height'])
+            state['vbar'].grid_remove()
+            if draft:
+                _, rows = draft
+                rightmost = max(row[1].x1 for row in rows)
+                lowest = max(row[1].y1 for row in rows)
+                width = min(max_width, max(width, math.ceil(self.origin_x+rightmost*self.scale-x)+2))
+                height = min(max_height, max(height, math.ceil(self.origin_y+lowest*self.scale-y)+2))
+            if not show_pdf:
+                if preview is not None:
+                    preview.place_forget()
+                # Native word wrapping also breaks tokens longer than an entire row.
+                # Original PDF lines can use the remaining page width. Created
+                # text boxes keep their own width.
+                original_overflow = any(fitz.Rect(line['bbox']).x1 > self.doc[state['page']].rect.x1
+                                        for line in state.get('lines', []))
+                editor.configure(wrap='none' if original_overflow else 'word')
+                if state.get('lines') and not state.get('block') and not unchanged:
+                    width = max_width
+                self.canvas.itemconfigure(state['window'], width=width, height=height)
+                editor.update_idletasks()
+                count = editor.count('1.0', 'end', 'ypixels')
+                wanted_height = (count[0] if count else 0)+2
+                height = min(max_height, max(height, wanted_height))
+                self.canvas.itemconfigure(state['window'], height=height)
+                editor.update_idletasks()
+                if editor.yview() != (0.0, 1.0) and width > 20:
+                    state['vbar'].grid(row=0, column=1, sticky='ns')
+                editor.see('insert')
             else:
-                state['vbar'].grid_remove()
+                editor.configure(wrap=state['wrap'])
             self.canvas.itemconfigure(state['window'], width=width, height=height)
-            editor.see('insert')
-            if view_height > 100:
-                top = self.canvas.coords(state['window'])[1]
-                bottom = top+height
-                view_bottom = self.canvas.canvasy(view_height)
-                if bottom > view_bottom:
-                    region = list(map(float, self.canvas.tk.splitlist(self.canvas.cget('scrollregion'))))
-                    if len(region) == 4:
-                        region[3] = max(region[3], bottom+16)
-                        self.canvas.configure(scrollregion=tuple(region))
-                        self.canvas.yview_moveto(max(0, (bottom+12-view_height-region[1])/(region[3]-region[1])))
+            # A hidden canvas window has no bounding box. Map it before
+            # cropping the PDF preview, otherwise the preview stays blank.
+            self.canvas.itemconfigure(state['window'], state='normal')
+            if show_pdf:
+                state['rendered_rows'] = draft[1] if draft else state['original_rows']
+                state['rendered_photo'] = draft[0] if draft else None
+                preview.place(x=0, y=0, relwidth=1, relheight=1)
+                preview.tk.call('raise', str(preview))
+                self.draw_inline_original()
+            self.draw_inline_box()
             editor.edit_modified(False)
         except tk.TclError:
-            pass
+            if self.inline_editor is editor:
+                preview = state.get('original_view')
+                if preview is not None:
+                    preview.place_forget()
+                self.draw_inline_box()
 
-    def precise_line_index(self, page, line, point):
-        """Use PDF glyph geometry for a single line; fall back when extraction differs."""
+    def inline_pdf_chars(self, raw, line):
         expected = text_edit.line_text(line)
         bounds = fitz.Rect(line['bbox'])
-        raw = page.get_text('rawdict', clip=fitz.INFINITE_RECT())
         choices = []
         for block in raw.get('blocks', []):
             for item in block.get('lines', []):
@@ -4377,9 +4594,14 @@ class PDFTool:
                 chars = [char for span in item.get('spans', []) for char in span.get('chars', [])]
                 if ''.join(c.get('c','') for c in chars) == expected:
                     choices.append((error, chars))
-        if not choices:
+        return min(choices, key=lambda item:item[0])[1] if choices else []
+
+    def precise_line_index(self, page, line, point):
+        """Use PDF glyph geometry for a single line; fall back when extraction differs."""
+        raw = page.get_text('rawdict', clip=fitz.INFINITE_RECT())
+        chars = self.inline_pdf_chars(raw, line)
+        if not chars:
             return text_edit.line_index(line, point)
-        chars = min(choices, key=lambda item:item[0])[1]
         direction = fitz.Point(line['dir'])
         projected = point.x*direction.x + point.y*direction.y
         for i, char in enumerate(chars):
@@ -4387,7 +4609,7 @@ class PDFTool:
             center = (rect.tl+rect.br)/2
             if projected < center.x*direction.x+center.y*direction.y:
                 return i
-        return len(expected)
+        return len(chars)
 
     def precise_block_index(self, page, starts, text, point):
         if not starts: return len(text)
@@ -4407,10 +4629,181 @@ class PDFTool:
         if newline >= 0: ends.append(newline)
         return max(start, min(start+max(0,offset), min(ends)))
 
+    def inline_pdf_rows(self, page, value, starts):
+        raw = page.get_text('rawdict', flags=fitz.TEXTFLAGS_RAWDICT & ~fitz.TEXT_PRESERVE_IMAGES,
+                            clip=fitz.INFINITE_RECT())
+        rows = []
+        for i, (start, skip, line) in enumerate(starts):
+            text = text_edit.line_text(line)
+            stop = starts[i+1][0] if i+1 < len(starts) else len(value)
+            length = min(len(text)-skip, stop-start)
+            while length > 0 and value[start+length-1] == '\n':
+                length -= 1
+            if length <= 0:
+                continue
+            chars = self.inline_pdf_chars(raw, line)[skip:skip+length]
+            if not chars or abs(line['dir'][1]) > .01 or line['dir'][0] < .99:
+                continue
+            rect = fitz.Rect(line['bbox'])
+            edges = [fitz.Rect(char['bbox']).x0 for char in chars]
+            edges.append(fitz.Rect(chars[-1]['bbox']).x1)
+            rows.append((start, rect, edges))
+        return rows
+
+    def setup_inline_original(self, page, starts):
+        """Keep the same page pixels visible while the original text is untouched."""
+        editor, state = self.inline_editor, self.inline_state
+        if state['page'] not in self.page_photos:
+            return
+        rows = self.inline_pdf_rows(page, state['old'], starts)
+        if not rows:
+            return
+        preview = tk.Canvas(state['frame'], borderwidth=0, highlightthickness=0, cursor='xterm',
+                            takefocus=False)
+        state.update(original_view=preview, original_rows=rows)
+        for sequence, action in (('<Button-1>', 'click'), ('<Shift-Button-1>', 'extend'),
+                                 ('<B1-Motion>', 'drag'), ('<Double-Button-1>', 'word'),
+                                 ('<Triple-Button-1>', 'line')):
+            preview.bind(sequence, lambda event, action=action: self.click_inline_original(event, action))
+        preview.bind('<Button-3>', self.inline_context_menu)
+        preview.bind('<MouseWheel>', self.mouse_wheel)
+        editor.bind('<KeyRelease>', lambda event: self.draw_inline_original(), add='+')
+        editor.bind('<<Selection>>', lambda event: self.draw_inline_original(), add='+')
+
+    def inline_draft_preview(self, value):
+        """Render straightforward replacements with the same PDF writer used for saving."""
+        state = self.inline_state
+        index = state['page']
+        parts = value.split('\n')
+        lines = state['lines']
+        _, _, width, height = self.page_layout[index]
+        if (len(parts) != len(lines) or any(not part.strip() for part in parts)
+                or len(value) > 2000 or len(self.doc) > 8 or width*height > 4_000_000):
+            return None
+        try:
+            keys, runs = self.inline_runs(value)
+            cache_key = (value, tuple(keys))
+            if state.get('draft_key') == cache_key:
+                return state.get('draft')
+            state.update(draft_key=cache_key, draft=None)
+            if 'draft_base' not in state:
+                state['draft_base'] = self.doc.tobytes(garbage=0)
+            if len(state['draft_base']) > 12_000_000:
+                return None
+            with fitz.open(stream=state['draft_base'], filetype='pdf') as document:
+                page = document[index]
+                self.write_inline_text(page, state, value, keys, runs)
+                candidates = [line for _, line in full_text_lines(page)]
+                starts, start = [], 0
+                previous_y = -math.inf
+                for old, part in zip(lines, parts):
+                    ox, oy = old['spans'][0]['origin']
+                    offset = 0
+                    while offset < len(part):
+                        matches = []
+                        for item in candidates:
+                            gx, gy = item['spans'][0]['origin']
+                            content = text_edit.line_text(item).rstrip()
+                            if (gy <= previous_y+.1 or gy > page.rect.y1 or abs(gx-ox) >= 1
+                                    or not content or not part.startswith(content, offset)):
+                                continue
+                            rank = abs(gy-oy) if offset == 0 else gy-previous_y
+                            matches.append((rank, gy, item, len(content)))
+                        if not matches:
+                            return None
+                        _, previous_y, line, length = min(matches, key=lambda item: item[:2])
+                        starts.append((start+offset, 0, line))
+                        offset += length
+                        while offset < len(part) and part[offset] == ' ':
+                            offset += 1
+                    start += len(part)+1
+                rows = self.inline_pdf_rows(page, value, starts)
+                if len(rows) != len(starts) or any(rect.x1 > page.rect.x1+.5 for _, rect, _ in rows):
+                    return None
+                pix = page.get_pixmap(matrix=fitz.Matrix(self.scale, self.scale), alpha=False)
+                photo = ImageTk.PhotoImage(Image.frombytes('RGB', (pix.width, pix.height), pix.samples))
+            state['draft'] = (photo, rows)
+            return state['draft']
+        except (RuntimeError, ValueError, tk.TclError):
+            return None
+
+    def click_inline_original(self, event, action):
+        editor, state = self.inline_editor, self.inline_state
+        x, y = self.canvas.coords(state['window'])
+        px = (x+event.x-self.origin_x)/self.scale
+        py = (y+event.y-self.origin_y)/self.scale
+        start, rect, edges = min(state['rendered_rows'],
+                                 key=lambda row: abs(py-(row[1].y0+row[1].y1)/2))
+        column = min(range(len(edges)), key=lambda i: abs(edges[i]-px))
+        index = editor.index(f'1.0+{start+column}c')
+        anchor = state.get('original_anchor', editor.index('insert'))
+        editor.tag_remove('sel', '1.0', 'end')
+        if action in ('extend', 'drag'):
+            first, last = sorted((anchor, index), key=lambda item: tuple(map(int, item.split('.'))))
+            editor.tag_add('sel', first, last)
+        elif action == 'word':
+            word = editor.index(index + ('-1c' if column == len(edges)-1 else ''))
+            editor.tag_add('sel', word+' wordstart', word+' wordend')
+            index = editor.index(word+' wordend')
+        elif action == 'line':
+            editor.tag_add('sel', index+' linestart', index+' lineend')
+            index = editor.index(index+' lineend')
+        if action != 'drag' and action != 'extend':
+            state['original_anchor'] = index
+        editor.mark_set('insert', index)
+        editor.focus_set()
+        self.draw_inline_original()
+        return 'break'
+
+    def draw_inline_original(self):
+        editor, state = self.inline_editor, self.inline_state
+        if not editor or not state:
+            return
+        preview = state.get('original_view')
+        if preview is None or preview.winfo_manager() != 'place':
+            return
+        x, y, right, bottom = self.canvas.bbox(state['window'])
+        page_x, page_y, _, _ = self.page_layout[state['page']]
+        source = self.page_photos.get(state['page']) or state.get('original_photo_source')
+        if source is None:
+            return
+        state['original_photo_source'] = source
+        source = state.get('rendered_photo') or source
+        crop = (x-round(page_x), y-round(page_y), right-round(page_x), bottom-round(page_y))
+        if (source, crop) != state.get('original_crop'):
+            photo = tk.PhotoImage(master=preview)
+            photo.tk.call(str(photo), 'copy', str(source), '-from', *crop)
+            state.update(original_crop=(source, crop), original_photo=photo)
+            preview.delete('original')
+            preview.create_image(0, 0, image=photo, anchor='nw', tags='original')
+            preview.tag_lower('original')
+        preview.delete('original-caret')
+        def offset(index):
+            count = editor.count('1.0', index, 'chars')
+            return count[0] if count else 0
+        insert = offset('insert')
+        selected = editor.tag_ranges('sel')
+        first, last = map(offset, selected[:2]) if selected else (0, 0)
+        def local_x(value): return page_x+value*self.scale-x
+        for start, rect, edges in state['rendered_rows']:
+            end = start+len(edges)-1
+            top = page_y+rect.y0*self.scale-y
+            base = page_y+rect.y1*self.scale-y
+            a, b = max(first, start), min(last, end)
+            if a < b:
+                preview.create_rectangle(local_x(edges[a-start]), top, local_x(edges[b-start]), base,
+                                         fill='#176bc0', stipple='gray25', outline='', tags='original-caret')
+            if start <= insert <= end and not selected:
+                caret = local_x(edges[insert-start])
+                preview.create_line(caret, top, caret, base, fill='#0056b3', width=2, tags='original-caret')
+
     def start_inline(self, click=None, explicit_group=False):
         if self.inline_editor or not self.selected_line or not self.selection:
             return
         lines = self.selected_paragraph or [self.selected_line]
+        page = self.doc[self.page_index]
+        block = self.selected_block
+        block_content, starts = added_text.contents(page, block) if block else (None, [])
         # Any multi-line pick must be edited as a group; the single-line path joins
         # the lines with spaces and would destroy the block on write-back.
         if not explicit_group and not self.selected_block and len(lines) > 1:
@@ -4424,12 +4817,34 @@ class PDFTool:
                 keys.extend(part.keys); decor.extend(part.decor)
             styled = text_styles.Styled(old, keys, decor, pieces[0].main)
         else:
-            old = added_text.contents(self.doc[self.page_index], self.selected_block)[0].text if self.selected_block else (text_edit.paragraph_text(lines) if len(lines) > 1 else text_edit.line_text(lines[0]))
+            old = block_content.text if block else text_edit.line_text(lines[0])
+        if not block:
+            start = 0
+            for line in lines:
+                starts.append((start, 0, line))
+                start += len(text_edit.line_text(line))+1
         rect = fitz.Rect(self.selection)
         main = text_edit.main_span(lines[0])
         font_size = max(10, round(main['size'] * self.scale))
-        wrap = 'none' if not self.selected_block and len(lines) == 1 else 'word'
+        # Existing PDF lines already have positions; do not invent extra line
+        # breaks just because the editor and PDF have slightly different metrics.
+        # Explicit line breaks must stay on their original lines even when Tk's
+        # glyph widths are a little larger than the PDF's, especially at 72 pt.
+        # Keep word wrapping for blocks containing genuine soft-wrapped rows.
+        wrap = 'word' if self.selected_block and len(lines) > len(old.split('\n')) else 'none'
         family = self.tk_family(main.get('font', ''))
+        # Match the overlay width to the page line so the caret sits on the letter
+        # the user clicked instead of drifting along the line. Compare the same
+        # line on both sides: the widest line of the block and its own PDF box.
+        text_parts = old.split('\n') if old else []
+        probe_index, probe_width = 0, 0.0
+        for index, item in enumerate(lines[:len(text_parts)]):
+            width = fitz.Rect(item['bbox']).width
+            if width > probe_width:
+                probe_index, probe_width = index, width
+        if text_parts and probe_index < len(text_parts):
+            font_size = self.fit_editor_font_size(text_parts[probe_index], fitz.Rect(lines[probe_index]['bbox']),
+                                                  family, font_size)
         color = '#%06x' % (int(main.get('color') or 0) & 0xffffff)
         editor, layout = self.create_inline_widget(rect, font_size, wrap, family, color)
         self.canvas.delete('selection')
@@ -4437,25 +4852,35 @@ class PDFTool:
         editor.edit_reset()
         editor.focus_set()
         if click:
+            # The PDF glyph boxes say which letter the pointer is on; the editor's own
+            # font metrics drift over a long line, so translate through the PDF first.
             point = fitz.Point((click[0]-self.origin_x)/self.scale, (click[1]-self.origin_y)/self.scale)
             if self.selected_block:
-                _, starts = added_text.contents(self.doc[self.page_index], self.selected_block)
                 index = self.precise_block_index(self.doc[self.page_index], starts, old, point)
             elif len(lines) == 1:
                 index = self.precise_line_index(self.doc[self.page_index], lines[0], point)
             else:
-                _, offsets = text_edit._paragraph_parts(lines)
-                starts = [(offset, len(text_edit.line_text(line))-len(text_edit.line_text(line).lstrip()), line)
-                          for offset, line in zip(offsets, lines)]
-                index = self.precise_block_index(self.doc[self.page_index], starts, old, point)
-            editor.mark_set('insert', f'1.0+{index}c')
+                # Which line did the click land on? Measure that line's glyphs
+                # (accurate) and add the offset of the line inside the block text.
+                clicked_index, best_gap = 0, None
+                for position, line in enumerate(lines):
+                    box = fitz.Rect(line['bbox'])
+                    gap = 0.0 if box.y0 - 2 <= point.y <= box.y1 + 2 else min(abs(point.y - box.y0),
+                                                                             abs(point.y - box.y1))
+                    if best_gap is None or gap < best_gap:
+                        clicked_index, best_gap = position, gap
+                offset = sum(len(text_edit.line_text(item)) + 1 for item in lines[:clicked_index])
+                index = offset + self.precise_line_index(self.doc[self.page_index], lines[clicked_index], point)
+            editor.mark_set('insert', f'1.0+{max(0, min(index, len(old)))}c')
         else:
             editor.mark_set('insert', 'end-1c')
         editor.bind('<Control-Return>', lambda event: (self.apply_inline(), 'break')[1])
         editor.bind('<Escape>', lambda event: (self.cancel_inline(), 'break')[1])
         editor.bind('<Button-3>', self.inline_context_menu)
         self.inline_editor = editor
-        self.inline_state = {'lines': lines, 'old': old, 'page': self.page_index, 'block':self.selected_block, **layout}
+        self.inline_state = {'lines': lines, 'old': old, 'page': self.page_index, 'block':self.selected_block,
+                             'display_font_scale': font_size / max(1, main['size'] * self.scale), **layout}
+        self.inline_state['original_position'] = self.canvas.coords(layout['window'])
         if explicit_group:
             bases = [float(line['spans'][0]['origin'][1]) for line in lines]
             steps = sorted(b-a for a,b in zip(bases,bases[1:]) if b-a > .1)
@@ -4464,10 +4889,40 @@ class PDFTool:
                 'step':steps[len(steps)//2] if steps else styled.main.size*1.2,
                 'decor':styled.decor, 'line_defaults':[part.main for part in pieces]})
         else:
-            styled = added_text.contents(self.doc[self.page_index], self.selected_block)[0] if self.selected_block else text_styles.read_paragraph(self.doc[self.page_index], lines)
+            styled = block_content if block else text_styles.read_paragraph(page, lines)
         if styled.text != old:
             styled = styled._replace(text=old, keys=text_styles.restyle(styled.text, styled.keys, old, styled.main))
         self.initialise_inline_styles(styled)
+        # PDF bounding boxes include font-dependent space above the baseline;
+        # Tk uses different font metrics. Align the first baseline rather than
+        # the top of the two bounding boxes so editing doesn't visibly jump.
+        if lines and lines[0].get('spans'):
+            try:
+                first_tag = next((tag for tag in editor.tag_names('1.0')
+                                  if tag in self.inline_state['style_tags']), None)
+                face = tkfont.Font(font=editor.tag_cget(first_tag, 'font') if first_tag else editor.cget('font'))
+                desired_y = self.origin_y + lines[0]['spans'][0]['origin'][1] * self.scale
+                editor.update_idletasks()
+                line_info = editor.dlineinfo('1.0')
+                baseline = line_info[1] + line_info[4] if line_info else face.metrics('ascent')
+                x, _ = self.canvas.coords(layout['window'])
+                self.canvas.coords(layout['window'], x, desired_y - baseline)
+                # A PDF may position lines farther apart than Tk's default line
+                # height. Preserve that extra space for the original lines.
+                for index, (line, following) in enumerate(zip(lines, lines[1:]), 1):
+                    if not following.get('spans'): continue
+                    row = editor.dlineinfo(f'{index}.0')
+                    if not row: continue
+                    advance = (following['spans'][0]['origin'][1] - line['spans'][0]['origin'][1]) * self.scale
+                    extra = round(advance - row[3])
+                    if extra > 0:
+                        name = f'pdf_line_spacing_{index}'
+                        editor.tag_configure(name, spacing3=extra)
+                        editor.tag_add(name, f'{index}.0', f'{index}.end+1c')
+            except (tk.TclError, ValueError, IndexError):
+                pass
+        self.inline_state['input_position'] = self.canvas.coords(layout['window'])
+        self.setup_inline_original(page, starts)
         editor.edit_modified(False)
         editor.bind('<<Modified>>', self.schedule_inline_layout)
         self.schedule_inline_layout()
@@ -4528,10 +4983,126 @@ class PDFTool:
             state = self.inline_state or {}
             if state.get('layout_job'): self.root.after_cancel(state['layout_job'])
             state.get('frame', self.inline_editor).destroy()
+            self.canvas.delete('inline-box')
             self.inline_editor = None
             self.inline_state = None
             self.show()
         return True
+
+    def write_plain_inline_lines(self, page, lines, parts, available_width, follow_line=False):
+        """Wrap at the page edge and preserve the original gaps inside this text block."""
+        if follow_line and '\n' not in parts[0] and abs(lines[0]['dir'][1]) < .01:
+            line = lines[0]
+            width = available_width(line['spans'][0]['origin'][0])
+            if text_edit.plain_line_row_count(page, line, parts[0], width) > 1:
+                page_lines = full_text_lines(page)
+                matching = next((item for _, item in page_lines
+                                 if item['bbox'] == line['bbox'] and text_edit.line_text(item) == text_edit.line_text(line)), None)
+                if matching is not None:
+                    baseline = line['spans'][0]['origin'][1]
+                    following = [item for item in self.text_block_lines(page_lines, matching, page)
+                                 if item['spans'][0]['origin'][1] > baseline+.1]
+                    lines = [line, *following]
+                    parts = [parts[0], *(text_edit.line_text(item) for item in following)]
+        changes = []
+        offset = 0.0
+        for line, part in zip(lines, parts):
+            changed = part != text_edit.line_text(line)
+            if not changed and not offset:
+                continue
+            origin = line['spans'][0]['origin']
+            width = available_width(origin[0]) if changed else None
+            changes.append((line, part, offset, width))
+            count = text_edit.plain_line_row_count(page, line, part, width) if changed else 1
+            extra = (count-1)*1.2*text_edit.main_span(line)['size']
+            if (offset or extra) and origin[1]+offset+extra > page.rect.y1-.5:
+                raise ValueError('自动换行后超出页面底部，请调小字号或把文字移到有足够空间的位置。')
+            offset += extra
+        # Move the lower original lines first, so their removal cannot touch a
+        # newly written continuation from a line above them.
+        for line, part, dy, width in reversed(changes):
+            text_edit.replace_line(page, line, part, offset=(0, dy), scan=None, wrap_width=width)
+
+    def write_inline_text(self, page, state, text, keys, runs):
+        # Never write a paragraph back in a different order than it was read.
+        if len(state.get('lines') or []) > 1:
+            state = {**state, 'lines': sorted(state['lines'],
+                                    key=lambda item: (round(fitz.Rect(item['bbox']).y0, 1),
+                                                      fitz.Rect(item['bbox']).x0))}
+        lines = state.get('lines', [])
+        page_right = page.rect.x1 - 0.5
+        def available_width(x):
+            original_right = max((fitz.Rect(line['bbox']).x1 for line in lines
+                                  if abs(line['spans'][0]['origin'][0]-x) < 1), default=page_right)
+            # If the source already extends beyond the page, preserve its
+            # existing line when inserting a small amount of text.
+            right = max(page_right, original_right + (text_edit.main_span(lines[0])['size'] if original_right > page_right else 0))
+            return max(1, right-x)
+        para_wrap = available_width(min(line['spans'][0]['origin'][0] for line in lines)) if lines else None
+        if state.get('kind') == 'new':
+            size = state['base_style'].size
+            rect = state['rect']
+            added_text.write(page, (rect.x0, rect.y0+size), 0, text,
+                             keys, size*1.2, rect.width, box=rect)
+        elif state.get('kind') == 'group':
+            text_edit.refuse_with_marks(page)
+            parts = text.split('\n')
+            # Fidelity first: when the line count did not change, rewrite every
+            # line at its own baseline with its own font and size. Nothing but
+            # the edited glyphs moves (measured: baseline/font/size deltas 0.000).
+            keep_layout = (len(parts) == len(lines) and all(part.strip() for part in parts)
+                           and not state.get('format_changed') and len(set(keys)) <= 1
+                           and all(not text_edit.mixed_styles(line) for line in lines))
+            if keep_layout:
+                self.write_plain_inline_lines(page, lines, parts, available_width)
+            else:
+                if text:
+                    added_text._refuse(text)
+                    fonts, resolved_text, resolved_keys = text_styles.resolve_all(page, text, keys)
+                text_edit._remove_lines(page, lines, decor=state.get('decor', ()))
+                if text:
+                    rect, origin = state['rect'], state['origin']
+                    wrap = available_width(origin.x)
+                    rect = fitz.Rect(rect)
+                    rows = text_styles.wrap(list(zip(resolved_text, resolved_keys)), fonts, wrap)
+                    widths = [pieces[-1][3] for row, _, _ in rows
+                              if (pieces := text_styles.pieces(text_styles.strip_row(row), fonts))]
+                    rect.x1 = min(page_right, max(rect.x1, origin.x+max(widths, default=0)))
+                    rect.y1 = max(rect.y1, origin.y + (len(rows)-1)*state['step'] + keys[0].size*.3)
+                    added_text.write(page, origin, 0, resolved_text, resolved_keys, state['step'],
+                                     wrap, fonts=fonts, box=rect)
+        elif state.get('block'):
+            block = state['block']
+            styled, _ = added_text.contents(page, block)
+            box = block.props['box']
+            width = box.width
+            if not block.props['rotate']:
+                width = min(width, available_width(block.props['origin'].x))
+            added_text.rewrite(page, block, text, runs, width, styled=styled, box=box)
+        elif state.get('format_changed') or len(set(keys)) > 1:
+            styled = text_styles.read_paragraph(page, state['lines'])
+            text_edit.replace_paragraph(page, state['lines'], text, runs=runs,
+                                        decor=styled.decor, wrap_width=para_wrap)
+        elif len(state['lines']) > 1:
+            # Write the whole paragraph in reading order; the engine keeps the
+            # line breaks. Wrap at the page edge (not at the original box width),
+            # otherwise adding one character wraps a long line into two.
+            text_edit.replace_paragraph(page, state['lines'], text, wrap_width=para_wrap)
+        else:
+            # Keep the edited line inside the page: without a wrap width a long
+            # insertion becomes one line that runs off the paper.
+            line = state['lines'][0]
+            wrap = available_width(line['spans'][0]['origin'][0])
+            body = text.rstrip('\n')
+            if '\n' in body:
+                # Enter inside a single-line edit means a real paragraph break;
+                # writing it as one line would overflow and overlap the next line.
+                text_edit.replace_paragraph(page, state['lines'], body, wrap_width=wrap)
+            else:
+                if body.strip():
+                    self.write_plain_inline_lines(page, [line], [body], available_width, follow_line=True)
+                else:
+                    text_edit.replace_line(page, line, body, scan=None, wrap_width=wrap)
 
     def apply_inline(self):
         if not self.inline_editor: return True
@@ -4544,79 +5115,10 @@ class PDFTool:
         try:
             page = self.doc[state['page']]
             keys, runs = self.inline_runs(text)
-            # Never write a paragraph back in a different order than it was read.
-            if len(state.get('lines') or []) > 1:
-                state['lines'] = sorted(state['lines'],
-                                        key=lambda item: (round(fitz.Rect(item['bbox']).y0, 1),
-                                                          fitz.Rect(item['bbox']).x0))
-            para_wrap = None
-            if len(state.get('lines') or []) > 1:
-                block_rect = fitz.Rect(state['lines'][0]['bbox'])
-                for item in state['lines'][1:]:
-                    block_rect |= fitz.Rect(item['bbox'])
-                para_wrap = max(block_rect.width + 12, page.rect.x1 - block_rect.x0 - 4)
-            if state.get('kind') == 'new':
-                size = state['base_style'].size
-                rect = state['rect']
-                added_text.write(page, (rect.x0, rect.y0+size), 0, text,
-                                 keys, size*1.2, rect.width, box=rect)
-            elif state.get('kind') == 'group':
-                text_edit.refuse_with_marks(page)
-                parts = text.split('\n')
-                lines = state['lines']
-                # Fidelity first: when the line count did not change, rewrite every
-                # line at its own baseline with its own font and size. Nothing but
-                # the edited glyphs moves (measured: baseline/font/size deltas 0.000).
-                keep_layout = (len(parts) == len(lines) and all(part.strip() for part in parts)
-                               and not state.get('format_changed') and len(set(keys)) <= 1)
-                if keep_layout:
-                    for line, part in zip(lines, parts):
-                        # Leave untouched lines completely alone: re-encoding identical
-                        # text only adds anti-aliasing noise to the page.
-                        if part == text_edit.line_text(line):
-                            continue
-                        text_edit.replace_line(page, line, part)
-                else:
-                    if text:
-                        added_text._refuse(text)
-                        fonts, resolved_text, resolved_keys = text_styles.resolve_all(page, text, keys)
-                    text_edit._remove_lines(page, lines, decor=state.get('decor', ()))
-                    if text:
-                        rect, origin = state['rect'], state['origin']
-                        # Wrap at the block width plus slack: using the exact box width
-                        # wrapped a long line into two as soon as one character was added.
-                        wrap = max(2, min(rect.x1 - origin.x + 16, page.rect.x1 - origin.x - 2))
-                        added_text.write(page, origin, 0, resolved_text, resolved_keys, state['step'],
-                                         wrap, fonts=fonts, box=rect)
-            elif state.get('block'):
-                block = state['block']
-                styled, _ = added_text.contents(page, block)
-                added_text.rewrite(page, block, text, runs, block.props['box'].width,
-                                   styled=styled, box=block.props['box'])
-            elif state.get('format_changed') or len(set(keys)) > 1:
-                styled = text_styles.read_paragraph(page, state['lines'])
-                text_edit.replace_paragraph(page, state['lines'], text, runs=runs,
-                                            decor=styled.decor, wrap_width=para_wrap)
-            elif len(state['lines']) > 1:
-                # Write the whole paragraph in reading order; the engine keeps the
-                # line breaks. Wrap at the page edge (not at the original box width),
-                # otherwise adding one character wraps a long line into two.
-                text_edit.replace_paragraph(page, state['lines'], text, wrap_width=para_wrap)
-            else:
-                # Keep the edited line inside the page: without a wrap width a long
-                # insertion becomes one line that runs off the paper.
-                line = state['lines'][0]
-                line_rect = fitz.Rect(line['bbox'])
-                wrap = max(20, page.rect.x1 - line_rect.x0 - 10)
-                body = text.rstrip('\n')
-                if '\n' in body:
-                    # Enter inside a single-line edit means a real paragraph break;
-                    # writing it as one line would overflow and overlap the next line.
-                    text_edit.replace_paragraph(page, state['lines'], body, wrap_width=wrap)
-                else:
-                    text_edit.replace_line(page, line, body, scan=None, wrap_width=wrap)
+            self.write_inline_text(page, state, text, keys, runs)
             if state.get('layout_job'): self.root.after_cancel(state['layout_job'])
             state.get('frame', editor).destroy()
+            self.canvas.delete('inline-box')
             self.inline_editor = None
             self.inline_state = None
             self.commit(original, previous_dirty)

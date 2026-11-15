@@ -27,12 +27,12 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = 'PDF 标签编辑器'
 APP_EXE = 'PDF标签编辑器.exe'
-VERSION = '1.0.0'
+VERSION = '1.1.2'
 PUBLISHER = 'PDF 标签编辑器'
 UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\PDFLabelEditor'
 CREATION_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
 
-BATCH_TEMPLATE = '@echo off\nchcp 936 >nul\ntitle 卸载 PDF 标签编辑器\necho.\necho   即将卸载 PDF 标签编辑器\necho   安装位置：{install}\necho.\nchoice /c YN /m "确定卸载"\nif errorlevel 2 exit /b 0\nreg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PDFLabelEditor" /f >nul 2>nul\ndel "%USERPROFILE%\\Desktop\\PDF 标签编辑器.lnk" >nul 2>nul\ndel "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\PDF 标签编辑器.lnk" >nul 2>nul\nstart "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 2; Remove-Item -LiteralPath \'{install}\' -Recurse -Force -ErrorAction SilentlyContinue"\nexit /b 0\n'
+BATCH_TEMPLATE = '@echo off\nchcp 936 >nul\ntitle 卸载 PDF 标签编辑器\necho.\necho   即将卸载程序，PDF 和素材库将保留。\necho   安装位置：%~dp0\necho.\nchoice /c YN /m "确定卸载"\nif errorlevel 2 exit /b 0\nreg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PDFLabelEditor" /f >nul 2>nul\ndel "%~dp0PDF标签编辑器.exe" >nul 2>nul\ndel "%~dp0app.ico" "%~dp0pdf_doc.ico" "%~dp0installed.json" >nul 2>nul\ndel "%~f0" >nul 2>nul\nexit /b 0\n'
 
 
 def payload_dir():
@@ -156,13 +156,9 @@ def uninstall(target, silent=False):
         try: link.unlink()
         except OSError: pass
     remove_uninstall_key()
-    if target.is_dir():
-        try:
-            shutil.rmtree(target, ignore_errors=False)
-        except OSError:
-            # The running uninstall.exe cannot delete itself; schedule it.
-            subprocess.Popen(f'cmd /c ping 127.0.0.1 -n 3 >nul & rd /s /q "{target}"', shell=True,
-                             creationflags=CREATION_FLAGS)
+    for name in (APP_EXE, 'app.ico', 'pdf_doc.ico', 'installed.json', 'uninstall.cmd'):
+        try: (target / name).unlink()
+        except OSError: pass
     if not silent:
         messagebox.showinfo('卸载完成', f'{APP_NAME} 已卸载。')
 

@@ -1,7 +1,8 @@
 ﻿# Build the Windows installer (single EXE) that carries the application payload.
 # It asks for an install folder and can create Desktop / Start-menu shortcuts.
 param(
-    [string]$OutDir = 'outputs\安装包'
+    [string]$OutDir = 'outputs\安装包',
+    [string]$AppDir = 'outputs\可执行版-重建'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,7 +10,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $env:PYTHONPATH = Join-Path $PSScriptRoot 'pyinstaller-build'
 
-$app = 'outputs\可执行版-重建'
+$app = $AppDir
 $exe = Join-Path $app 'PDF标签编辑器.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "missing app build: $exe" }
 
