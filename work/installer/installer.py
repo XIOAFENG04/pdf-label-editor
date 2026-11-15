@@ -21,13 +21,14 @@ import sys
 import time
 import tkinter as tk
 import winreg
+import base64
 import pdf_association
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = 'PDF 标签编辑器'
 APP_EXE = 'PDF标签编辑器.exe'
-VERSION = '1.1.2'
+VERSION = '1.1.3'
 PUBLISHER = 'PDF 标签编辑器'
 UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\PDFLabelEditor'
 CREATION_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
@@ -46,24 +47,51 @@ def default_dir():
 
 
 def powershell(script):
-    subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-                   creationflags=CREATION_FLAGS, capture_output=True)
+    # Encode the command as UTF-16LE so redirected/Chinese installation paths
+    # cannot be corrupted by the console code page.
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    result = subprocess.run(
+        ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+         '-EncodedCommand', encoded], creationflags=CREATION_FLAGS,
+        capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'PowerShell command failed')
 
 
 def make_shortcut(link, target, workdir, icon):
-    link = str(link)
-    script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
-              "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Save()"
-              % (link, target, workdir, icon))
+    link = Path(link)
+    link.parent.mkdir(parents=True, exist_ok=True)
+
+    # Passing values through JSON gives PowerShell correctly escaped Unicode
+    # strings, including paths containing apostrophes or non-ASCII characters.
+    values = [str(link), str(target), str(workdir), str(icon)]
+    encoded_values = [json.dumps(value, ensure_ascii=False) for value in values]
+    script = ("$v=@(%s);$s=(New-Object -ComObject WScript.Shell).CreateShortcut($v[0]);"
+              "$s.TargetPath=$v[1];$s.WorkingDirectory=$v[2];$s.IconLocation=$v[3]+',0';"
+              "$s.Save();if(-not(Test-Path -LiteralPath $v[0])){throw 'Shortcut was not created'}"
+              % ','.join(encoded_values))
     powershell(script)
 
 
 def desktop_link():
+    # Windows may redirect Desktop to OneDrive or another drive.  Resolve the
+    # shell folder instead of assuming it is %USERPROFILE%\\Desktop.
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders') as key:
+            value, _ = winreg.QueryValueEx(key, 'Desktop')
+            path = Path(os.path.expandvars(value)).expanduser()
+            path.mkdir(parents=True, exist_ok=True)
+            return path / f'{APP_NAME}.lnk'
+    except (OSError, TypeError):
+        pass
     for name in ('Desktop', '桌面'):
         path = Path.home() / name
         if path.is_dir():
             return path / f'{APP_NAME}.lnk'
-    return Path.home() / 'Desktop' / f'{APP_NAME}.lnk'
+    path = Path.home() / 'Desktop'
+    path.mkdir(parents=True, exist_ok=True)
+    return path / f'{APP_NAME}.lnk'
 
 
 def start_menu_link():
