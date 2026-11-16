@@ -2175,7 +2175,7 @@ class PDFTool:
         """Ask GitHub for the latest release without blocking the UI."""
         import threading
         import updater
-        repo = str(self.prefs.get('update_repo') or '').strip() or updater.DEFAULT_REPO
+        repo = updater.DEFAULT_REPO
         window = parent or self.root
         self.status.config(text='正在检查更新…')
 
@@ -2264,7 +2264,7 @@ class PDFTool:
         open_mode = tk.StringVar(value=current['open_mode'])
         zoom_mode = tk.StringVar(value=current['zoom'])
         theme_mode = tk.StringVar(value=current['theme'])
-        update_repo = tk.StringVar(value=str(self.prefs.get('update_repo') or ''))
+        import updater
         rows = [
             ('打开 PDF 时', open_mode, list(self.OPEN_MODES), '同一窗口时，双击多个 PDF 只保留一个窗口，后打开的进新标签页。'),
             ('打开时缩放', zoom_mode, list(self.ZOOM_MODES), '影响之后打开的每一份 PDF。'),
@@ -2278,21 +2278,14 @@ class PDFTool:
             ttk.Label(frame, text=hint, style='Hint.TLabel', wraplength=420).grid(
                 row=base + 1, column=0, columnspan=2, sticky='w')
 
-        ttk.Label(frame, text='更新仓库').grid(row=len(rows)*2, column=0, sticky='w', pady=(10, 0))
-        ttk.Entry(frame, textvariable=update_repo, width=24).grid(
-            row=len(rows)*2, column=1, sticky='w', padx=(14, 0), pady=(10, 0))
-        ttk.Label(frame, text='填 GitHub 的“用户名/仓库名”，例如 someone/pdf-label-editor；用于检查更新。',
-                  style='Hint.TLabel', wraplength=420).grid(
-            row=len(rows)*2+1, column=0, columnspan=2, sticky='w')
+        ttk.Label(frame, text='软件版本').grid(row=len(rows)*2, column=0, sticky='w', pady=(10, 0))
+        ttk.Label(frame, text=updater.APP_VERSION).grid(row=len(rows)*2, column=1, sticky='w', padx=(14, 0), pady=(10, 0))
 
         def check_updates_now():
-            self.prefs['update_repo'] = update_repo.get().strip()
-            settings.save(self.prefs)
             self.check_updates(parent=dialog)
 
         def save():
             self.prefs['open_mode'] = self.OPEN_MODES[open_mode.get()]
-            self.prefs['update_repo'] = update_repo.get().strip()
             self.prefs['default_zoom'] = self.ZOOM_MODES[zoom_mode.get()]
             wanted = self.THEME_MODES[theme_mode.get()]
             theme_changed = wanted != self.prefs.get('theme')
@@ -5334,7 +5327,29 @@ class PDFTool:
                         'origin':fitz.Point(lines[0]['spans'][0]['origin']), 'rotation':0, 'bounds':fitz.Rect(rect)}
             clip = fitz.open()
             target = clip.new_page(width=rect.width, height=rect.height)
-            target.show_pdf_page(target.rect, self.doc, self.page_index, clip=rect)
+            source = self.doc
+            filtered = None
+            if self.selected_kind == '区域':
+                # Use the same complete-object rule as area deletion. Work on a
+                # temporary document so partially touched neighbours cannot leak
+                # into the copied clip and the original page remains untouched.
+                filtered = fitz.open(stream=self.doc.tobytes(garbage=0, deflate=True), filetype='pdf')
+                source = filtered
+                page = source[self.page_index]
+                objects = page_objects.Objects(page)
+                numbers = [item['n'] for item in objects.items
+                           if not rect.contains(fitz.Rect(item['rect']))]
+                lines = [line for bounds, line in full_text_lines(page) if not rect.contains(bounds)]
+                if numbers:
+                    page_objects.delete(page, numbers, objects)
+                if lines:
+                    text_edit.refuse_with_marks(page)
+                    text_edit._remove_lines(page, lines)
+            try:
+                target.show_pdf_page(target.rect, source, self.page_index, clip=rect)
+            finally:
+                if filtered is not None:
+                    filtered.close()
             self.clipboard_pdf = clip.tobytes(garbage=4, deflate=True)
             clip.close()
             self.clipboard_size = (rect.width, rect.height)
