@@ -8,7 +8,14 @@ from tkinter import messagebox
 import settings
 
 KEY_HASH = 'cfb8f86f83f723a20ecb167eee52053997e088f4b20196ecd6940ccc6243d409'
-MARKER = 'activated-v1'
+MARKER_PREFIX = 'activated-v2:'
+
+
+def activation_marker():
+    """Keep activation for updates in the same install, not unrelated copies."""
+    executable_dir = Path(sys.executable).resolve().parent
+    identity = hashlib.sha256(str(executable_dir).casefold().encode('utf-8')).hexdigest()[:16]
+    return MARKER_PREFIX + identity
 
 
 def valid_key(key):
@@ -71,7 +78,8 @@ def prompt_key(root):
 
 def activate(root):
     prefs = settings.load()
-    if prefs.get('activation') == MARKER:
+    marker = activation_marker()
+    if prefs.get('activation') == marker:
         return True
     key = prompt_key(root)
     if key is None:
@@ -79,7 +87,7 @@ def activate(root):
     if not valid_key(key):
         messagebox.showerror('激活失败', '密钥不正确，软件将退出。', parent=root)
         return False
-    prefs['activation'] = MARKER
+    prefs['activation'] = marker
     if not settings.save(prefs):
         messagebox.showerror('激活失败', '无法保存激活状态，请检查用户设置目录的写入权限。', parent=root)
         return False
