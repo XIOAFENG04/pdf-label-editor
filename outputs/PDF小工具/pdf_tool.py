@@ -380,6 +380,7 @@ class PDFTool:
         self.snap_enabled = tk.BooleanVar(value=True)
         self.snap_candidates = None
         self.placing_text = False
+        self.placing_shape = None
         self.selected_kind = None
         self.selected_line = None
         self.selected_paragraph = None
@@ -401,7 +402,7 @@ class PDFTool:
         bar = ttk.Frame(root, padding=(12, 8, 12, 4))
         bar.pack(fill='x')
         # Row 1: file -> print -> page/zoom, with the panel toggles on the right.
-        for label, action, accent in [('打开', self.open, False), ('保存', self.save, False), ('另存为', self.save_as, False)]:
+        for label, action, accent in [('新建', self.new_blank_dialog, False), ('打开', self.open, False), ('保存', self.save, False), ('另存为', self.save_as, False)]:
             RoundButton(bar, text=label, command=action, accent=accent, min_width=56).pack(side='left', padx=(0, 4))
         RoundButton(bar, text='打印', command=self.print_pdf, accent=True, min_width=56).pack(side='left', padx=(6, 0))
         ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=8, pady=3)
@@ -444,10 +445,14 @@ class PDFTool:
         editbar.pack(fill='x')
         # Row 2: select -> edit -> history -> text format, with 更多 on the right.
         ttk.Label(editbar, text='选择', style='Hint.TLabel').pack(side='left', padx=(0, 4))
-        ttk.Combobox(editbar, textvariable=self.selection_type, values=['自动选择', '整块文字', '框选区域', '选择文字', '选择文本框', '选择图片', '选择图形'], state='readonly', width=8).pack(side='left')
+        ttk.Combobox(editbar, textvariable=self.selection_type, values=['自动选择', '框选区域'], state='readonly', width=8).pack(side='left')
         ttk.Separator(editbar, orient='vertical').pack(side='left', fill='y', padx=8, pady=3)
-        for label, action in [('编辑', self.replace), ('文本框', self.add_text), ('图片', self.add_image), ('删除', self.delete_selected)]:
+        RoundButton(editbar, text='编辑', command=self.replace, min_width=44).pack(side='left', padx=(4, 0))
+        ttk.Label(editbar, text='插入', style='Hint.TLabel').pack(side='left', padx=(9, 2))
+        for label, action in [('文本框', self.add_text), ('图片', self.add_image), ('线条 / 图形', self.insert_shape_dialog)]:
             RoundButton(editbar, text=label, command=action, min_width=44).pack(side='left', padx=(4, 0))
+        ttk.Separator(editbar, orient='vertical').pack(side='left', fill='y', padx=(8, 3), pady=3)
+        RoundButton(editbar, text='删除', command=self.delete_selected, min_width=44).pack(side='left', padx=(4, 0))
         ttk.Separator(editbar, orient='vertical').pack(side='left', fill='y', padx=8, pady=3)
         for label, action in [('撤销', self.undo), ('重做', self.redo)]:
             RoundButton(editbar, text=label, command=action, min_width=44).pack(side='left', padx=(4, 0))
@@ -700,14 +705,18 @@ class PDFTool:
         self.root.after_idle(self.show_empty_workspace)
         self.enable_pdf_drop()
         self.root.bind('<Control-Shift-Z>', lambda event: self.shortcut(event, self.redo))
-        for key, action in [('z', self.undo), ('y', self.redo), ('o', self.open), ('s', self.save), ('c', self.copy_area), ('x', self.cut_area), ('v', self.paste_area)]:
+        for key, action in [('n', self.new_blank_dialog), ('z', self.undo), ('y', self.redo), ('o', self.open), ('s', self.save), ('c', self.copy_area), ('x', self.cut_area), ('v', self.paste_area)]:
             self.root.bind('<Control-'+key+'>', lambda event, fn=action: self.shortcut(event, fn))
+        # Some keyboard layouts and IMEs report a different keysym for the
+        # same physical key. Handle the Windows virtual-key code as a fallback.
+        self.root.bind('<KeyPress>', self.shortcut_physical, add='+')
         for event, action in [('<Control-Shift-S>', self.save_as), ('<Control-p>', self.print_pdf), ('<Control-plus>', lambda:self.zoom(1.1)), ('<Control-equal>', lambda:self.zoom(1.1)), ('<Control-minus>', lambda:self.zoom(1/1.1)), ('<Control-0>', self.fit_page), ('<Prior>', lambda:self.turn(-1)), ('<Next>', lambda:self.turn(1)), ('<Left>', lambda:self.canvas.xview_scroll(-3,'units')), ('<Right>', lambda:self.canvas.xview_scroll(3,'units')), ('<Up>', lambda:self.canvas.yview_scroll(-3,'units')), ('<Down>', lambda:self.canvas.yview_scroll(3,'units'))]:
             self.root.bind(event, lambda e, fn=action: self.shortcut(e, fn))
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.root.bind('<Delete>', lambda event: self.shortcut(event, self.delete_selected))
         self.root.bind('<BackSpace>', lambda event: self.shortcut(event, self.delete_selected))
         self.root.bind('<Control-w>', lambda event: self.shortcut(event, self.close_tab))
+        self.root.bind('<Escape>', self.cancel_shape_placement, add='+')
         self.load_assets()
         self.remote_paths = None
         # Every secondary window (dialogs, pickers) opens centred on the main one.
@@ -2129,6 +2138,18 @@ class PDFTool:
         action()
         return 'break'
 
+    def shortcut_physical(self, event):
+        if sys.platform != 'win32' or not (event.state & 0x4) or (event.state & 0x20000):
+            return
+        actions = {67: self.copy_area, 86: self.paste_area, 88: self.cut_area,
+                   90: self.undo, 89: self.redo}
+        action = actions.get(event.keycode)
+        if action is None:
+            return
+        if event.keycode == 90 and event.state & 0x1:
+            action = self.redo
+        return self.shortcut(event, action)
+
     OPEN_MODES = {'同一窗口，新标签页': 'same_window', '每次打开新窗口': 'new_window'}
     ZOOM_MODES = {'320%（标签常用）': 'percent', '实际大小 100%': 'actual', '适合页面': 'fit', '适合宽度': 'fit_width', '记住上次比例': 'last'}
     THEME_MODES = {'跟随系统': 'system', '浅色': 'light', '深色': 'dark'}
@@ -2258,7 +2279,7 @@ class PDFTool:
         frame.pack(fill='both', expand=True)
         current = {
             'open_mode': next((k for k, v in self.OPEN_MODES.items() if v == self.prefs.get('open_mode')), '同一窗口，新标签页'),
-            'zoom': next((k for k, v in self.ZOOM_MODES.items() if v == self.prefs.get('default_zoom')), '320%（标签常用）'),
+            'zoom': next((k for k, v in self.ZOOM_MODES.items() if v == self.prefs.get('default_zoom')), '适合页面'),
             'theme': next((k for k, v in self.THEME_MODES.items() if v == self.prefs.get('theme')), '跟随系统'),
         }
         open_mode = tk.StringVar(value=current['open_mode'])
@@ -2284,6 +2305,18 @@ class PDFTool:
         def check_updates_now():
             self.check_updates(parent=dialog)
 
+        def open_uninstaller():
+            if not getattr(sys, 'frozen', False):
+                messagebox.showinfo('卸载', '请在安装版中使用卸载功能。', parent=dialog); return
+            folder = Path(sys.executable).parent
+            uninstaller = folder / '卸载PDF标签编辑器.exe'
+            if not uninstaller.is_file():
+                messagebox.showerror('卸载', '未找到卸载程序，请使用新版安装包覆盖安装后重试。', parent=dialog); return
+            if not messagebox.askyesno('卸载软件', '将先关闭编辑器，再打开卸载页面。未保存的文件会提示保存。是否继续？', parent=dialog): return
+            dialog.destroy()
+            if self.close():
+                subprocess.Popen([str(uninstaller), '--uninstall', '--dir', str(folder)], cwd=str(folder))
+
         def save():
             self.prefs['open_mode'] = self.OPEN_MODES[open_mode.get()]
             self.prefs['default_zoom'] = self.ZOOM_MODES[zoom_mode.get()]
@@ -2300,6 +2333,7 @@ class PDFTool:
         buttons.grid(row=len(rows) * 2 + 2, column=0, columnspan=2, sticky='e', pady=(18, 0))
         ttk.Button(buttons, text='保存', style='Primary.TButton', command=save).pack(side='right')
         ttk.Button(buttons, text='检查更新', command=check_updates_now).pack(side='right', padx=(0, 8))
+        ttk.Button(buttons, text='卸载软件', command=open_uninstaller).pack(side='left', padx=(0, 8))
         ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right', padx=(0, 8))
         dialog.update_idletasks()
         dialog.geometry(f'+{self.root.winfo_rootx() + 90}+{self.root.winfo_rooty() + 90}')
@@ -2375,6 +2409,7 @@ class PDFTool:
                     except tk.TclError: pass
                     setattr(self, attr, None)
             self.root.destroy()
+            return True
         finally:
             self.closing = False
 
@@ -2384,6 +2419,171 @@ class PDFTool:
         if not paths: return
         for path in paths:
             self.open_path(path)
+
+    def new_blank_document(self, width_mm, height_mm):
+        if self.inline_editor and not self.apply_inline(): return
+        if not (math.isfinite(width_mm) and math.isfinite(height_mm) and 1 <= width_mm <= 5080 and 1 <= height_mm <= 5080):
+            raise ValueError('页面宽高应在 1 至 5080 毫米之间。')
+        self.store_tab()
+        doc = fitz.open()
+        doc.new_page(width=width_mm * 72 / 25.4, height=height_mm * 72 / 25.4)
+        frame = ttk.Frame(self.tab_control)
+        name = '未命名.pdf'
+        self.tab_control.add(frame, text=name + ' *  ×')
+        tab = str(frame)
+        self.tabs[tab] = {'doc':doc, 'path':name, 'page_index':0, 'scale':1.5,
+                          'last_file_stat':None, 'dirty':True, 'undo_data':[], 'redo_data':[], 'anchor':None}
+        self.tab_control.select(tab)
+        self.activate_tab(tab)
+        self.root.update_idletasks()
+        self.apply_open_zoom()
+
+    def new_blank_dialog(self):
+        dialog = tk.Toplevel(self.root); dialog.title('新建空白页面'); dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=20); frame.pack(fill='both', expand=True)
+        sizes = {'标签 100 × 100 毫米':(100,100), '物流标签 100 × 150 毫米':(100,150),
+                 '物流标签 4 × 6 英寸（101.6 × 152.4 毫米）':(101.6,152.4),
+                 '条码标签 57 × 25 毫米':(57,25), '条码标签 50 × 25 毫米':(50,25),
+                 '条码标签 40 × 30 毫米':(40,30), '条码标签 40 × 20 毫米':(40,20),
+                 '商品标签 30 × 20 毫米':(30,20), '商品标签 70 × 50 毫米':(70,50),
+                 '商品标签 80 × 50 毫米':(80,50), '标签 100 × 50 毫米':(100,50),
+                 '标签 50 × 30 毫米':(50,30), '标签 60 × 40 毫米':(60,40),
+                 'A4 210 × 297 毫米':(210,297), 'A5 148 × 210 毫米':(148,210),
+                 'Letter 215.9 × 279.4 毫米':(215.9,279.4)}
+        choice = tk.StringVar(value=next(iter(sizes)))
+        width = tk.StringVar(value='100'); height = tk.StringVar(value='100')
+        ttk.Label(frame, text='选择标签尺寸', style='Title.TLabel').grid(row=0, column=0, columnspan=3, sticky='w', pady=(0,12))
+        ttk.Label(frame, text='常用尺寸').grid(row=1, column=0, sticky='w')
+        combo = ttk.Combobox(frame, textvariable=choice, values=list(sizes), state='readonly', width=27)
+        combo.grid(row=1, column=1, columnspan=2, sticky='ew', padx=(10,0))
+        def choose(event=None):
+            w,h = sizes[choice.get()]; width.set(str(w)); height.set(str(h))
+        combo.bind('<<ComboboxSelected>>', choose)
+        ttk.Label(frame, text='自定义尺寸（毫米）').grid(row=2, column=0, pady=(16,0), sticky='w')
+        width_entry = ttk.Entry(frame, textvariable=width, width=11); width_entry.grid(row=2, column=1, pady=(16,0), padx=(10,5))
+        ttk.Entry(frame, textvariable=height, width=11).grid(row=2, column=2, pady=(16,0))
+        ttk.Label(frame, text='可直接修改宽度和高度，范围为 1–5080 毫米。', style='Hint.TLabel').grid(row=3, column=0, columnspan=3, sticky='w', pady=(8,0))
+        preview = tk.Canvas(frame, width=320, height=150, background='#e7edf5', highlightthickness=0)
+        preview.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(14,0))
+        preview_caption = ttk.Label(frame, text='', style='Hint.TLabel'); preview_caption.grid(row=5, column=0, columnspan=3, pady=(5,0))
+        def update_preview(*args):
+            preview.delete('all')
+            try:
+                w,h = float(width.get()),float(height.get())
+                if not (math.isfinite(w) and math.isfinite(h) and 1 <= w <= 5080 and 1 <= h <= 5080): raise ValueError()
+            except ValueError:
+                preview_caption.config(text='请输入有效的宽度和高度。'); return
+            cw = max(1, preview.winfo_width()); ch = max(1, preview.winfo_height())
+            if cw <= 1: cw = 320
+            if ch <= 1: ch = 150
+            scale = min(max(1,cw-40)/w, max(1,ch-30)/h); pw,ph=w*scale,h*scale
+            preview.create_rectangle((cw-pw)/2,(ch-ph)/2,(cw+pw)/2,(ch+ph)/2,fill='white',outline='#94a3b8')
+            preview_caption.config(text=f'页面预览  ·  {w:g} × {h:g} 毫米')
+        width.trace_add('write',update_preview); height.trace_add('write',update_preview)
+        preview.bind('<Configure>', update_preview); update_preview()
+        def create():
+            try: self.new_blank_document(float(width.get()), float(height.get()))
+            except ValueError as exc: messagebox.showerror('新建页面', str(exc), parent=dialog); return
+            dialog.destroy()
+        row = ttk.Frame(frame); row.grid(row=6, column=0, columnspan=3, sticky='e', pady=(20,0))
+        ttk.Button(row, text='取消', command=dialog.destroy).pack(side='right')
+        ttk.Button(row, text='创建', command=create, style='Primary.TButton').pack(side='right', padx=(0,8))
+        self.center_dialog(dialog); dialog.grab_set()
+
+    def cancel_shape_placement(self, event=None):
+        if self.placing_shape:
+            self.placing_shape = None
+            self.canvas.config(cursor='')
+            self.canvas.delete('selection')
+            self.status.config(text='已取消绘制。')
+            return 'break'
+
+    def insert_shape_dialog(self):
+        if not self.doc:
+            messagebox.showinfo('插入图形', '请先打开或新建 PDF。', parent=self.root); return
+        if self.inline_editor and not self.apply_inline(): return
+        dialog = tk.Toplevel(self.root); dialog.title('插入线条 / 图形'); dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=20); frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='设置线条和图形', style='Title.TLabel').grid(row=0, column=0, columnspan=2, sticky='w', pady=(0,12))
+        shape = tk.StringVar(value='线条'); style = tk.StringVar(value='实线')
+        width = tk.StringVar(value='0.5'); color = tk.StringVar(value='#000000')
+        for row, (label, variable, choices) in enumerate((('类型',shape,['线条','矩形','椭圆']),
+                                                          ('线型',style,['实线','短虚线','长虚线','点线','点划线']))):
+            ttk.Label(frame, text=label).grid(row=row+1, column=0, sticky='w', pady=5)
+            ttk.Combobox(frame, textvariable=variable, values=choices, state='readonly', width=22).grid(row=row+1, column=1, sticky='ew', padx=(12,0), pady=5)
+        ttk.Label(frame, text='线宽（磅）').grid(row=3, column=0, sticky='w', pady=5)
+        ttk.Entry(frame, textvariable=width, width=20).grid(row=3, column=1, sticky='ew', padx=(12,0), pady=5)
+        def choose_color():
+            _, selected = colorchooser.askcolor(color=color.get(), parent=dialog)
+            if selected: color.set(selected)
+        ttk.Label(frame, text='颜色').grid(row=4, column=0, sticky='w', pady=5)
+        color_row = ttk.Frame(frame); color_row.grid(row=4, column=1, sticky='w', padx=(12,0))
+        ttk.Button(color_row, text='选择颜色', command=choose_color).pack(side='left')
+        ttk.Label(color_row, textvariable=color, style='Hint.TLabel').pack(side='left', padx=(8,0))
+        ttk.Label(frame, text='效果预览', style='Hint.TLabel').grid(row=5, column=0, columnspan=2, sticky='w', pady=(12,5))
+        preview = tk.Label(frame, bg='white', relief='solid', bd=1)
+        preview.grid(row=6, column=0, columnspan=2, sticky='ew')
+        preview_hint = ttk.Label(frame, text='', style='Hint.TLabel'); preview_hint.grid(row=7, column=0, columnspan=2, sticky='w', pady=(5,0))
+        def update_preview(*args):
+            try:
+                value=float(width.get())
+                if not math.isfinite(value) or not .1 <= value <= 40: raise ValueError()
+                spec={'kind':shape.get(),'style':style.get(),'width':value,'color':color.get()}
+                with fitz.open() as sample:
+                    page=sample.new_page(width=260,height=88)
+                    p0=fitz.Point(22,44 if spec['kind']=='线条' else 20)
+                    p1=fitz.Point(238,44 if spec['kind']=='线条' else 68)
+                    self.draw_shape_on_page(page,p0,p1,spec)
+                    pix=page.get_pixmap(matrix=fitz.Matrix(2,2),alpha=False)
+                    im=Image.open(io.BytesIO(pix.tobytes('png')))
+                    im.thumbnail((390,132),Image.Resampling.LANCZOS)
+                    preview.image=ImageTk.PhotoImage(im)
+                    preview.config(image=preview.image, text='', width=0, height=0)
+                preview_hint.config(text='预览使用 PDF 渲染；实际效果随缩放和打印分辨率变化。')
+            except (ValueError, KeyError):
+                preview.config(image='', text='请输入 0.1–40 磅的线宽', width=35, height=4)
+                preview_hint.config(text='')
+        for variable in (shape,style,width,color): variable.trace_add('write',update_preview)
+        update_preview()
+        ttk.Label(frame, text='拖动绘制；线条按 Shift 可水平或垂直对齐。\n线宽为实际打印宽度，放大页面时屏幕显示会变粗。', style='Hint.TLabel').grid(row=8, column=0, columnspan=2, sticky='w', pady=(12,0))
+        def start():
+            try:
+                value = float(width.get())
+                if not math.isfinite(value) or not .1 <= value <= 40: raise ValueError()
+            except ValueError:
+                messagebox.showerror('线宽', '请输入 0.1 到 40 磅之间的线宽。', parent=dialog); return
+            self.placing_shape = {'kind':shape.get(), 'style':style.get(), 'width':value, 'color':color.get()}
+            self.placing_text = False
+            self.canvas.config(cursor='crosshair'); self.status.config(text='拖动绘制线条或图形；按 Shift 水平或垂直对齐，Esc 取消。')
+            dialog.destroy(); self.canvas.focus_set()
+        buttons = ttk.Frame(frame); buttons.grid(row=9, column=0, columnspan=2, sticky='e', pady=(18,0))
+        ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right')
+        ttk.Button(buttons, text='开始绘制', command=start, style='Primary.TButton').pack(side='right', padx=(0,8))
+        self.center_dialog(dialog); dialog.grab_set()
+
+    def insert_shape(self, p0, p1, spec):
+        page = self.doc[self.page_index]
+        original = self.doc.tobytes(garbage=0, deflate=True)
+        try:
+            self.draw_shape_on_page(page, p0, p1, spec)
+            self.commit(original, self.dirty)
+            self.status.config(text='图形已插入，可选择并移动；Ctrl+Z 撤销。')
+        except Exception as exc:
+            self.doc.close(); self.doc = fitz.open(stream=original, filetype='pdf'); self.show()
+            messagebox.showerror('插入失败', str(exc), parent=self.root)
+
+    @staticmethod
+    def draw_shape_on_page(page, p0, p1, spec):
+        rgb = tuple(int(spec['color'][i:i+2],16)/255 for i in (1,3,5))
+        dash = {'实线':None, '短虚线':'[3 2] 0', '长虚线':'[8 4] 0',
+                '点线':'[1 2] 0', '点划线':'[8 3 1 3] 0'}[spec['style']]
+        options = dict(color=rgb, width=spec['width'], dashes=dash)
+        if spec['kind'] == '线条': page.draw_line(p0, p1, **options)
+        else:
+            rect = fitz.Rect(min(p0.x,p1.x), min(p0.y,p1.y), max(p0.x,p1.x), max(p0.y,p1.y))
+            if rect.width < 1 or rect.height < 1: raise ValueError('图形宽高不能小于 1 磅。')
+            if spec['kind'] == '矩形': page.draw_rect(rect, **options)
+            else: page.draw_oval(rect, **options)
 
     def popup_menu(self, menu, x, y, right=None):
         """Show a menu fully on screen; near an edge it is aligned to the button's right edge."""
@@ -2456,6 +2656,7 @@ class PDFTool:
         for name in ('doc','path','page_index','scale','last_file_stat','dirty','undo_data','redo_data'):
             setattr(self,name,state[name])
         self.placing_text = False
+        self.placing_shape = None
         self.canvas.config(cursor='')
         self.page_width = self.page_height = 0
         self.show(anchor=state.get('anchor'))
@@ -2533,7 +2734,7 @@ class PDFTool:
         wanted = {i for i, (_, y, _, h) in enumerate(self.page_layout) if y+h >= top-height*.3 and y <= bottom+height*.3}
         for i in list(self.page_photos):
             if i not in wanted:
-                self.canvas.delete(f'pdf-page-{i}'); self.canvas.delete(f'page-shadow-{i}'); del self.page_photos[i]
+                self.canvas.delete(f'pdf-page-{i}'); self.canvas.delete(f'page-shadow-{i}'); self.canvas.delete(f'empty-box-{i}'); del self.page_photos[i]
         for i in sorted(wanted):
             if i in self.page_photos: continue
             x, y, _, _ = self.page_layout[i]
@@ -2546,6 +2747,12 @@ class PDFTool:
             self.canvas.create_image(x, y, image=photo, anchor='nw', tags=('pdf-page', f'pdf-page-{i}'))
             self.canvas.tag_lower(f'pdf-page-{i}')
             self.canvas.tag_lower(f'page-shadow-{i}', f'pdf-page-{i}')
+            for annot in self.doc[i].annots() or []:
+                if annot.info.get('subject') == 'PDFLabelEditorEmptyTextBox':
+                    bounds = annot.rect
+                    self.canvas.create_rectangle(x+bounds.x0*self.scale, y+bounds.y0*self.scale,
+                        x+bounds.x1*self.scale, y+bounds.y1*self.scale,
+                        outline='#4f83bc', dash=(5,3), width=1, tags=('empty-box', f'empty-box-{i}'))
         if self.inline_editor and self.inline_state:
             self.canvas.tag_raise('inline-editor')
             self.inline_state['frame'].lift()
@@ -2633,7 +2840,7 @@ class PDFTool:
 
     def apply_open_zoom(self):
         """Apply the '打开时缩放' preference to the freshly opened tab."""
-        mode = self.prefs.get('default_zoom', 'percent')
+        mode = self.prefs.get('default_zoom', 'fit')
         if mode == 'percent':
             try: value = float(self.prefs.get('default_percent', 320)) / 100
             except (TypeError, ValueError): value = 3.2
@@ -2722,6 +2929,7 @@ class PDFTool:
 
     def press(self, event):
         if not self.doc: return
+        self.canvas.focus_set()
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         if self.inline_editor:
             prior = fitz.Rect(self.selection) if self.selection else None
@@ -2738,7 +2946,7 @@ class PDFTool:
             return
         page = self.page_at_canvas_point(x, y)
         if page is None:
-            if not self.placing_text:
+            if not self.placing_text and not self.placing_shape:
                 self.drag_start = (x, y)
                 self.drag_kind = 'outside_select'
                 self.canvas.delete('selection')
@@ -2750,6 +2958,10 @@ class PDFTool:
         self.snap_candidates = None
         self.drag_origin_rect = None
         self.edit_on_release = False
+        if self.placing_shape:
+            self.drag_kind = 'new_shape'
+            self.canvas.delete('selection')
+            return
         if self.placing_text:
             self.drag_kind = 'new_text'
             self.canvas.delete('selection')
@@ -2767,10 +2979,12 @@ class PDFTool:
                 self.drag_origin_quad = self.selection_quad()
                 return
             hit = fitz.Rect(self.selection) + (-4/self.scale, -4/self.scale, 4/self.scale, 4/self.scale)
-            if hit.contains(point) and self.selected_kind in ('文字', '图片', '图形', '区域'):
+            if hit.contains(point) and self.selected_kind in ('文字', '空文本框', '图片', '图形', '区域'):
                 self.drag_kind = 'move'
                 self.drag_origin_rect = fitz.Rect(self.selection)
-                if self.selected_kind == '文字':
+                if self.selected_kind == '空文本框':
+                    self.edit_on_release = True
+                elif self.selected_kind == '文字':
                     lines = self.selected_paragraph or ([self.selected_line] if self.selected_line else [])
                     self.edit_on_release = any(fitz.Rect(line['bbox']).contains(point) for line in lines)
                 return
@@ -2788,6 +3002,16 @@ class PDFTool:
                 return
         self.canvas.delete('selection')
 
+    def shape_drag_endpoint(self, x, y, state):
+        page = self.doc[self.page_index].rect
+        x = max(self.origin_x + page.x0*self.scale, min(self.origin_x + page.x1*self.scale, x))
+        y = max(self.origin_y + page.y0*self.scale, min(self.origin_y + page.y1*self.scale, y))
+        if self.placing_shape and self.placing_shape['kind'] == '线条' and state & 1:
+            x0, y0 = self.drag_start
+            if abs(x-x0) >= abs(y-y0): y = y0
+            else: x = x0
+        return x, y
+
     def drag(self, event):
         if self.drag_start is None: return
         if self.drag_kind == 'pan':
@@ -2796,7 +3020,23 @@ class PDFTool:
         self.canvas.delete('selection')
         self.canvas.delete('snap-guide')
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        if self.drag_kind == 'rotate' and self.drag_origin_rect:
+        if self.drag_kind == 'new_shape' and self.placing_shape:
+            x, y = self.shape_drag_endpoint(x, y, event.state)
+            spec = self.placing_shape
+            pixels = max(1, spec['width'] * self.scale)
+            patterns = {'实线':None, '短虚线':(3,2), '长虚线':(8,4), '点线':(1,2), '点划线':(8,3,1,3)}
+            pattern = patterns[spec['style']]
+            dash = tuple(max(1,round(v*self.scale)) for v in pattern) if pattern else None
+            opts = dict(fill=spec['color'], width=pixels, dash=dash, tags='selection')
+            x0,y0 = self.drag_start
+            if spec['kind'] == '线条':
+                self.canvas.create_line(x0,y0,x,y,**opts)
+            else:
+                opts['outline'] = opts.pop('fill'); opts['fill'] = ''
+                coords = (min(x0,x),min(y0,y),max(x0,x),max(y0,y))
+                if spec['kind'] == '矩形': self.canvas.create_rectangle(*coords,**opts)
+                else: self.canvas.create_oval(*coords,**opts)
+        elif self.drag_kind == 'rotate' and self.drag_origin_rect:
             angle = self.rotation_delta(x, y, bool(event.state & 1))
             r = self.drag_origin_rect
             cx, cy = self.origin_x+(r.x0+r.x1)*self.scale/2, self.origin_y+(r.y0+r.y1)*self.scale/2
@@ -2846,6 +3086,8 @@ class PDFTool:
             if abs(angle) >= .1: self.rotate_selected(angle)
             else: self.draw_selection(self.selection)
             return
+        if self.drag_kind == 'new_shape' and self.placing_shape:
+            x1, y1 = self.shape_drag_endpoint(x1, y1, event.state)
         self.drag_start = None
         if self.drag_kind == 'outside_select':
             self.drag_kind = None
@@ -2880,6 +3122,20 @@ class PDFTool:
                 return
             self.start_new_text_inline(rect)
             return
+        if self.drag_kind == 'new_shape':
+            self.drag_kind = None
+            spec, self.placing_shape = self.placing_shape, None
+            self.canvas.config(cursor='')
+            self.canvas.delete('selection')
+            p0 = fitz.Point((x0-self.origin_x)/self.scale, (y0-self.origin_y)/self.scale)
+            p1 = fitz.Point((x1-self.origin_x)/self.scale, (y1-self.origin_y)/self.scale)
+            page_rect = self.doc[self.page_index].rect
+            p0 = fitz.Point(max(page_rect.x0,min(page_rect.x1,p0.x)), max(page_rect.y0,min(page_rect.y1,p0.y)))
+            p1 = fitz.Point(max(page_rect.x0,min(page_rect.x1,p1.x)), max(page_rect.y0,min(page_rect.y1,p1.y)))
+            if abs(p1-p0) < 2:
+                self.status.config(text='拖动鼠标绘制线条或图形。'); return
+            self.insert_shape(p0, p1, spec)
+            return
         if self.drag_kind == 'resize':
             # A hairline has a degenerate quad; an oriented matrix would erase it,
             # so route it through the rect-based path instead.
@@ -2899,6 +3155,8 @@ class PDFTool:
             if abs(x1-x0)>=5 or abs(y1-y0)>=5:
                 dx,dy,_,_ = self.snap_movement((x1-x0)/self.scale, (y1-y0)/self.scale)
                 self.move_selected(dx, dy)
+            elif self.edit_on_release and self.selected_kind == '空文本框':
+                self.start_new_text_inline(fitz.Rect(self.selection), self.selected_object['xref'])
             elif self.edit_on_release and self.selected_kind == '文字':
                 group = len(self.selected_paragraph or []) > 1
                 self.start_inline((x1, y1), explicit_group=group)
@@ -3368,6 +3626,15 @@ class PDFTool:
         candidates = []
         mode = self.selection_type.get()
         self.selected_block = None
+        if mode == '自动选择':
+            for annot in page.annots() or []:
+                if annot.info.get('subject') == 'PDFLabelEditorEmptyTextBox' and annot.rect.contains(point):
+                    self.selection = fitz.Rect(annot.rect); self.selected_kind = '空文本框'
+                    self.selected_object = {'xref':annot.xref}; self.selected_line = None
+                    self.selected_paragraph = None; self.selection_lines = []
+                    self.draw_selection(self.selection)
+                    self.status.config(text='空文本框：拖动边角调整大小，点击输入文字。')
+                    return
         page_lines = full_text_lines(page) if mode in ('自动选择', '整块文字', '选择文字', '选择文本框') else []
         if mode in ('自动选择', '选择文字', '选择文本框'):
             blocks = [b for b in added_text.find(page, page_lines) if b.props.get('box') and
@@ -3490,7 +3757,9 @@ class PDFTool:
         target = old + (dx, dy, dx, dy)
         original = self.doc.tobytes(garbage=0, deflate=True)
         try:
-            if self.selected_kind == '文字':
+            if self.selected_kind == '空文本框':
+                page.load_annot(self.selected_object['xref']).set_rect(target + (1,1,-1,-1))
+            elif self.selected_kind == '文字':
                 lines = self.selected_paragraph or [self.selected_line]
                 if self.selected_block:
                     self.move_text_without_clipping(page, lines, (dx, dy), self.selected_block)
@@ -3500,7 +3769,7 @@ class PDFTool:
                 objects = page_objects.Objects(page)
                 page_objects.move_to(page, self.selected_graphic_numbers(objects), old, target, objects)
             elif self.selected_kind == '区域':
-                objects, ns, lines = self.area_contents(page, old)
+                objects, ns, lines = self.area_contents(page, old, include_hairlines=True)
                 if not ns and not lines: raise ValueError('框内没有可移动的完整对象，请扩大选框。')
                 if ns: page_objects.move_to(page, ns, old, target, objects)
                 if lines: self.move_text_without_clipping(page, lines, (dx, dy))
@@ -3509,7 +3778,10 @@ class PDFTool:
             kind = self.selected_kind
             was_box = self.selected_block is not None
             self.commit(original, self.dirty)
-            if kind in ('图片', '图形') and self.reselect_graphic(target, kind):
+            if kind == '空文本框':
+                self.selection, self.selected_kind = target, kind
+                self.draw_selection(target)
+            elif kind in ('图片', '图形') and self.reselect_graphic(target, kind):
                 pass
             elif kind == '文字' and was_box:
                 visible = target & self.doc[self.page_index].rect
@@ -3637,20 +3909,22 @@ class PDFTool:
         if doc[index].rect != original_rect:
             raise ValueError('无法恢复页面尺寸，未进行移动。')
 
-    def area_contents(self, page, rect):
+    def area_contents(self, page, rect, include_hairlines=False):
         objects = page_objects.Objects(page)
         # Hairlines (page borders, table rules) have a zero-width/height rect; scaling
         # them through a matrix erases them, so they are never part of a box scale.
-        selected = [item for item in objects.items
-                    if rect.contains(fitz.Rect(item['rect']))
-                    and fitz.Rect(item['rect']).width >= .5 and fitz.Rect(item['rect']).height >= .5]
+        def contained(item):
+            bounds = fitz.Rect(item['rect'])
+            return rect.x0 <= bounds.x0 <= bounds.x1 <= rect.x1 and rect.y0 <= bounds.y0 <= bounds.y1 <= rect.y1
+        selected = [item for item in objects.items if contained(item) and
+                    (include_hairlines or (fitz.Rect(item['rect']).width >= .5 and fitz.Rect(item['rect']).height >= .5))]
         # Page-edge clipping must not exclude a line whose visible portion was
         # fully selected, even when its PDF glyph bounds extend off the page.
         text = [(bounds, line) for bounds, line in full_text_lines(page)
                 if not (bounds & page.rect).is_empty and rect.contains(bounds & page.rect)]
         groups = [fitz.Rect(item['rect']) for item in selected if item.get('kind') == 'group']
         if any(group.intersects(bounds) for group in groups for bounds, line in text):
-            raise ValueError('框内的组合对象与文字重叠，暂不能安全整体处理。请在“选择图片”模式下单独选择该对象。')
+            raise ValueError('框内的组合对象与文字重叠，暂不能安全整体处理，请尝试单独选择对象。')
         return objects, [item['n'] for item in selected], [line for bounds, line in text]
 
     def text_block_lines(self, page_lines, line, page=None):
@@ -3779,7 +4053,10 @@ class PDFTool:
         kind_before = self.selected_kind
         selection_before = fitz.Rect(self.selection)
         try:
-            if self.selected_kind == '文字':
+            if self.selected_kind == '空文本框':
+                if target.width <= 2 or target.height <= 2: raise ValueError('文本框宽高必须大于 2 磅。')
+                page.load_annot(self.selected_object['xref']).set_rect(target + (1,1,-1,-1))
+            elif self.selected_kind == '文字':
                 lines = self.selected_paragraph or [self.selected_line]
                 if self.selected_block:
                     if any(not page.rect.contains(fitz.Rect(line['bbox'])) for line in lines):
@@ -3844,7 +4121,10 @@ class PDFTool:
             kind = self.selected_kind
             was_box = self.selected_block is not None or converted_box
             self.commit(original, self.dirty)
-            if kind in ('图片', '图形') and self.reselect_graphic(target, kind):
+            if kind == '空文本框':
+                self.selection, self.selected_kind = target, kind
+                self.draw_selection(target)
+            elif kind in ('图片', '图形') and self.reselect_graphic(target, kind):
                 pass
             elif kind == '文字' and was_box:
                 self.select_object((target.tl+target.br)/2)
@@ -4371,13 +4651,27 @@ class PDFTool:
         if value is None:
             value = self.font_bold_value.get() if field == 'bold' else self.font_italic_value.get()
         if not self.inline_editor:
+            if not self.doc or self.selected_kind != '文字' or not self.selected_line:
+                self.status.config(text='文字样式已设置，将用于新建文本框。')
+                return
             self.apply_text_format()
             return
         editor, state = self.inline_editor, self.inline_state
         try:
             start, end = editor.index('sel.first'), editor.index('sel.last')
         except tk.TclError:
-            messagebox.showinfo('文字格式', '请先在文字编辑区选中要修改的文字。', parent=self.root)
+            if state.get('kind') == 'new' and not editor.get('1.0', 'end-1c'):
+                state['base_style'] = state['base_style']._replace(**{field:value})
+                if field in ('size', 'bold', 'italic'):
+                    state['format'] = self.text_format_values()
+                base = state['base_style']
+                editor.configure(foreground='#%06x' % (base.color & 0xffffff),
+                    font=(self.tk_family(base.family or base.font), -max(1,round(base.size*self.scale)),
+                          'bold' if base.bold else 'normal', 'italic' if base.italic else 'roman'))
+                self.status.config(text='文字样式已设置，输入的文字将使用该样式。')
+                editor.focus_set()
+                return
+            messagebox.showinfo('文字格式', '请先选中需要修改的文字；新建空文本框可先设置样式再输入。', parent=self.root)
             editor.focus_set()
             return
         index = start
@@ -4501,6 +4795,12 @@ class PDFTool:
                                      outline='#0056b3', width=1, dash=(5, 3), tags='inline-box')
         self.canvas.tag_raise('inline-editor')
         state['frame'].lift()
+        grip = state.get('resize_grip')
+        if grip:
+            if state.get('kind') == 'new':
+                grip.place(relx=1, rely=1, anchor='se'); grip.lift()
+            else:
+                grip.place_forget()
 
     def fit_editor_font_size(self, sample, line_rect, family, guess):
         """Pick the pixel size whose rendered width best matches the page line.
@@ -4538,6 +4838,31 @@ class PDFTool:
         frame.grid_rowconfigure(0, weight=1)
         frame.grid_columnconfigure(0, weight=1)
         editor.grid(row=0, column=0, sticky='nsew')
+        grip = tk.Label(frame, text='◢', fg='#0056b3', bg='#eaf3ff', cursor='size_nw_se',
+                        borderwidth=0, font=('Arial', 9), takefocus=False)
+        def begin_resize(event):
+            state = self.inline_state
+            if not state or state.get('kind') != 'new': return 'break'
+            state['resize_start'] = (event.x_root, event.y_root, fitz.Rect(state['rect']))
+            return 'break'
+        def resize(event):
+            state = self.inline_state
+            if not state or not state.get('resize_start'): return 'break'
+            sx, sy, original = state['resize_start']
+            page = self.doc[state['page']].rect
+            right = min(page.x1, max(original.x0+8, original.x1+(event.x_root-sx)/self.scale))
+            bottom = min(page.y1, max(original.y0+8, original.y1+(event.y_root-sy)/self.scale))
+            state['rect'] = fitz.Rect(original.x0, original.y0, right, bottom)
+            state['base_width'] = max(24, round(state['rect'].width*self.scale)+2)
+            state['base_height'] = max(8, round(state['rect'].height*self.scale)+2)
+            self.schedule_inline_layout()
+            return 'break'
+        def finish_resize(event):
+            if self.inline_state: self.inline_state.pop('resize_start', None)
+            return 'break'
+        grip.bind('<ButtonPress-1>',begin_resize)
+        grip.bind('<B1-Motion>',resize)
+        grip.bind('<ButtonRelease-1>',finish_resize)
         width = max(24, round(rect.width*self.scale)+2)
         height = max(font_size+4, round(rect.height*self.scale)+2)
         left, top, right, bottom = self.inline_page_bounds(self.page_index)
@@ -4545,7 +4870,7 @@ class PDFTool:
         y = min(bottom-1, max(top, round(self.origin_y+rect.y0*self.scale)))
         window = self.canvas.create_window(x, y, anchor='nw', window=frame,
             width=min(width, right-x), height=min(height, bottom-y), state='hidden', tags='inline-editor')
-        return editor, {'frame':frame, 'window':window, 'vbar':vbar,
+        return editor, {'frame':frame, 'window':window, 'vbar':vbar, 'resize_grip':grip,
                         'base_width':width, 'base_height':height, 'wrap':wrap}
 
     def inline_page_bounds(self, page):
@@ -4607,6 +4932,11 @@ class PDFTool:
                 wanted_height = (count[0] if count else 0)+2
                 height = min(max_height, max(height, wanted_height))
                 self.canvas.itemconfigure(state['window'], height=height)
+                if state.get('kind') == 'new':
+                    rect = fitz.Rect(state['rect'])
+                    rect.y1 = min(self.doc[state['page']].rect.y1,
+                                  max(rect.y1, rect.y0 + max(0,height-2)/self.scale))
+                    state['rect'] = rect
                 editor.update_idletasks()
                 if editor.yview() != (0.0, 1.0) and width > 20:
                     state['vbar'].grid(row=0, column=1, sticky='ns')
@@ -4984,7 +5314,7 @@ class PDFTool:
         self.schedule_inline_layout()
         self.status.config(text='在页面上直接修改文字；Enter 换行，Ctrl+Enter 完成，Esc 取消。')
 
-    def start_new_text_inline(self, rect):
+    def start_new_text_inline(self, rect, empty_xref=None):
         self.canvas.config(cursor='')
         self.canvas.delete('selection')
         family = self.current_family() or 'Arial'
@@ -4994,7 +5324,7 @@ class PDFTool:
         # Type at the size the toolbar shows, so the preview and the committed text match.
         editor, layout = self.create_inline_widget(rect, max(8, round(text_format[0]*self.scale)), 'word', family, color)
         self.inline_editor = editor
-        self.inline_state = {'kind':'new', 'rect':fitz.Rect(rect), 'old':'', 'page':self.page_index, 'format':text_format, **layout}
+        self.inline_state = {'kind':'new', 'rect':fitz.Rect(rect), 'old':'', 'page':self.page_index, 'format':text_format, 'empty_xref':empty_xref, **layout}
         size, bold, italic = text_format
         family = self.current_family()
         rgb = tuple(v / 255 for v in self.font_color) if self.font_color_explicit else (0, 0, 0)
@@ -5096,10 +5426,38 @@ class PDFTool:
             return max(1, right-x)
         para_wrap = available_width(min(line['spans'][0]['origin'][0] for line in lines)) if lines else None
         if state.get('kind') == 'new':
-            size = state['base_style'].size
-            rect = state['rect']
-            added_text.write(page, (rect.x0, rect.y0+size), 0, text,
+            size = max([state['base_style'].size] + [key.size for key in keys])
+            rect = fitz.Rect(state['rect'])
+            required_bottom = rect.y0 + size * 1.5
+            if required_bottom > page.rect.y1:
+                raise ValueError('字号过大，文字超出页面底部；请调小字号或移动文本框。')
+            rect.y1 = min(page.rect.y1, max(rect.y1, required_bottom))
+            if state.get('empty_xref'):
+                page.delete_annot(page.load_annot(state['empty_xref']))
+            added_text.write(page, (rect.x0, rect.y0+size*1.2), 0, text,
                              keys, size*1.2, rect.width, box=rect)
+            # The selected text may contain multiple sizes and wrapped rows.
+            # Grow the editable box to the actual glyph bounds, not merely the
+            # original base font's size, and refuse overflow off the page.
+            marks = added_text.markers(page)
+            if marks:
+                mark = marks[-1]
+                last_baseline = mark['props']['origin'].y + max(mark['props']['rows'])
+                estimated_bottom = last_baseline + size*.35
+                if estimated_bottom > page.rect.y1+.5:
+                    raise ValueError('文字超出页面，请调小字号或调整文本框位置。')
+                rect.y1 = max(rect.y1, min(page.rect.y1, estimated_bottom))
+                matches = added_text.find(page, full_text_lines(page), found=[mark])
+                if matches and matches[0].lines:
+                    bounds = fitz.Rect()
+                    for line_rect, _ in matches[0].lines: bounds |= line_rect
+                    if bounds.x1 > page.rect.x1+.5 or bounds.y1 > page.rect.y1+.5:
+                        raise ValueError('文字超出页面，请调小字号或调整文本框位置。')
+                    rect |= bounds
+                mark['props']['box'] = rect
+                stream = page.parent.xref_stream(mark['xref'])
+                begin, end = mark['bdc']
+                page.parent.update_stream(mark['xref'], stream[:begin] + added_text.marker(mark['props']) + stream[end:])
         elif state.get('kind') == 'group':
             text_edit.refuse_with_marks(page)
             parts = text.split('\n')
@@ -5163,7 +5521,33 @@ class PDFTool:
     def apply_inline(self):
         if not self.inline_editor: return True
         editor, state = self.inline_editor, self.inline_state
+        if state.get('layout_job'):
+            self.root.after_cancel(state['layout_job'])
+            state['layout_job'] = None
+            self.update_inline_layout()
         text = editor.get('1.0', 'end-1c')
+        if state.get('kind') == 'new' and not text:
+            if state.get('empty_xref'):
+                rect, xref = fitz.Rect(state['rect']), state['empty_xref']
+                self.cancel_inline()
+            else:
+                original = self.doc.tobytes(garbage=0, deflate=True)
+                rect = fitz.Rect(state['rect'])
+                page = self.doc[state['page']]
+                annot = page.add_rect_annot(rect)
+                annot.set_border(width=0)
+                annot.update()
+                if rect.width > 2 and rect.height > 2: annot.set_rect(rect + (1,1,-1,-1))
+                annot.set_info(subject='PDFLabelEditorEmptyTextBox')
+                annot.set_flags(2)
+                xref = annot.xref
+                self.cancel_inline()
+                self.commit(original, self.dirty)
+            self.selection, self.selected_kind = rect, '空文本框'
+            self.selected_object = {'xref':xref}; self.selected_line = None; self.selected_paragraph = None
+            self.draw_selection(rect)
+            self.status.config(text='空文本框已保留；拖动边角调整大小，点击输入文字。')
+            return True
         if text == state['old'] and not state.get('format_changed'):
             return self.cancel_inline()
         original = self.doc.tobytes(garbage=0, deflate=True)
@@ -5329,7 +5713,7 @@ class PDFTool:
             target = clip.new_page(width=rect.width, height=rect.height)
             source = self.doc
             filtered = None
-            if self.selected_kind == '区域':
+            if self.selected_kind in ('区域', '图片', '图形'):
                 # Use the same complete-object rule as area deletion. Work on a
                 # temporary document so partially touched neighbours cannot leak
                 # into the copied clip and the original page remains untouched.
@@ -5337,9 +5721,27 @@ class PDFTool:
                 source = filtered
                 page = source[self.page_index]
                 objects = page_objects.Objects(page)
-                numbers = [item['n'] for item in objects.items
-                           if not rect.contains(fitz.Rect(item['rect']))]
-                lines = [line for bounds, line in full_text_lines(page) if not rect.contains(bounds)]
+                if self.selected_kind == '区域':
+                    numbers = [item['n'] for item in objects.items
+                               if not rect.contains(fitz.Rect(item['rect']))]
+                    lines = [line for bounds, line in full_text_lines(page) if not rect.contains(bounds)]
+                else:
+                    selected = set(self.selected_graphic_numbers(objects))
+                    numbers = [item['n'] for item in objects.items if item['n'] not in selected]
+                    keep_label_text = self.selected_object and self.selected_object.get('kind') == 'barcode'
+                    if self.selected_kind == '图片':
+                        try:
+                            image = self.selected_image_pixels().convert('L')
+                            image.thumbnail((1200, 1200))
+                            for y in range(image.height // 4, image.height * 3 // 4, max(1, image.height // 20)):
+                                row = [image.getpixel((x, y)) < 100 for x in range(image.width)]
+                                if sum(a != b for a, b in zip(row, row[1:])) >= 30:
+                                    keep_label_text = True
+                                    break
+                        except (ValueError, OSError):
+                            pass
+                    lines = [line for bounds, line in full_text_lines(page)
+                             if not (keep_label_text and rect.contains(bounds))]
                 if numbers:
                     page_objects.delete(page, numbers, objects)
                 if lines:
@@ -5353,6 +5755,9 @@ class PDFTool:
             self.clipboard_pdf = clip.tobytes(garbage=4, deflate=True)
             clip.close()
             self.clipboard_size = (rect.width, rect.height)
+            self.root.clipboard_clear()
+            self.root.clipboard_append('PDF 标签编辑器内部内容')
+            self.root.update_idletasks()
             self.clipboard_sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
             try:
                 asset = self.asset_clipboard_data()
@@ -5365,7 +5770,7 @@ class PDFTool:
             return False
 
     def select_inserted(self, rect, kind):
-        self.selection_type.set('选择文字' if kind == '文字' else '选择图片')
+        self.selection_type.set('自动选择')
         point = fitz.Point((rect.x0+rect.x1)/2, (rect.y0+rect.y1)/2)
         self.select_object(point)
 
@@ -5380,14 +5785,16 @@ class PDFTool:
         if self.selected_kind == '区域':
             self.delete_area()
             return
-        if self.selected_kind not in ('文字', '图片', '图形'):
+        if self.selected_kind not in ('文字', '空文本框', '图片', '图形'):
             return
         if not messagebox.askyesno('确认删除', '确定删除选中的内容吗？'):
             return
         page = self.doc[self.page_index]
         original = self.doc.tobytes(garbage=0, deflate=True)
         try:
-            if self.selected_kind == '文字':
+            if self.selected_kind == '空文本框':
+                page.delete_annot(page.load_annot(self.selected_object['xref']))
+            elif self.selected_kind == '文字':
                 lines = self.selected_paragraph or [self.selected_line]
                 if any(not page.rect.contains(fitz.Rect(line['bbox'])) for line in lines):
                     raise ValueError('文字有部分在页面外，暂不能安全删除。')
@@ -5504,7 +5911,7 @@ class PDFTool:
 
     def delete_selected_image(self):
         if self.selected_kind != '图片' or self.selection is None:
-            messagebox.showinfo('选择图片', '请先选择“选择图片”模式，再点击图片。')
+            messagebox.showinfo('选择图片', '请先使用自动选择点击图片。')
             return
         page = self.doc[self.page_index]
         if any(a.type[0] == fitz.PDF_ANNOT_REDACT for a in (page.annots() or [])):
@@ -5537,7 +5944,7 @@ class PDFTool:
     def selected_image_pixels(self):
         item = self.selected_object or {}
         if self.selected_kind != '图片' or item.get('kind') not in ('picture','group') or not item.get('xref'):
-            raise ValueError('请先在“选择图片”或“自动选择”模式下选择要裁剪的图片或粘贴内容。')
+            raise ValueError('请先使用自动选择选中要裁剪的图片或粘贴内容。')
         if item.get('kind') == 'group':
             return self.render_group_preview(item['xref'])
         doc = self.doc
@@ -5715,6 +6122,8 @@ class PDFTool:
     def save(self):
         if self.inline_editor and not self.apply_inline(): return
         if not self.doc: return
+        if self.last_file_stat is None:
+            self.save_as(); return
         if not self.dirty:
             messagebox.showinfo('保存', '当前文件没有需要保存的修改。')
             return
@@ -5774,8 +6183,30 @@ class PDFTool:
             return
         if getattr(self, '_print_job_active', False):
             messagebox.showinfo('打印', '已有打印任务正在提交，请等待完成。', parent=self.root); return
-        from printing import show_print_dialog
-        show_print_dialog(self, printer_dc, printer_mode)
+        if getattr(self, '_printer_discovery_active', False):
+            self.status.config(text='正在查找打印机，请稍候。'); return
+        import printing
+        import threading
+        results = queue.Queue()
+        document = self.doc
+        self._printer_discovery_active = True
+        self.status.config(text='正在查找打印机…')
+        def discover():
+            try: results.put((True, printing.list_printers()))
+            except Exception as exc: results.put((False, str(exc)))
+        def poll():
+            try: ok, result = results.get_nowait()
+            except queue.Empty:
+                self.root.after(150, poll); return
+            self._printer_discovery_active = False
+            if self.doc is not document:
+                self.status.config(text='文档已切换，请重新打开打印。'); return
+            if not ok:
+                messagebox.showerror('打印机', '无法获取打印机列表：\n' + result, parent=self.root); return
+            self.status.config(text='请选择打印设置。')
+            printing.show_print_dialog(self, printer_dc, printer_mode, printer_list=result)
+        threading.Thread(target=discover, daemon=True).start()
+        self.root.after(150, poll)
 
 def open_startup_files(app, arguments):
     """Open PDFs passed by Windows, for example when files are dropped on the EXE."""
@@ -5801,6 +6232,12 @@ if __name__ == '__main__':
                 sys.exit(0)
             if attempt < 3: time.sleep(0.25)
     root = tk.Tk()
+    root.withdraw()
+    import activation
+    if not activation.activate(root):
+        root.destroy()
+        sys.exit(0)
+    root.deiconify()
     app = PDFTool(root)
     if single:
         app.start_single_instance()

@@ -16,6 +16,13 @@ if (-not (Test-Path -LiteralPath $exe)) { throw "missing app build: $exe" }
 
 $payload = Join-Path $PSScriptRoot 'installer\payload'
 New-Item -ItemType Directory -Force -Path $payload | Out-Null
+$uninstallDist = Join-Path $PSScriptRoot 'installer\uninstall-dist'
+$ErrorActionPreference = 'Continue'
+& python -m PyInstaller --noconfirm --clean --onefile --windowed --name '卸载PDF标签编辑器' --icon (Resolve-Path 'work\assets\app.ico').Path --paths (Resolve-Path 'outputs\PDF小工具').Path --distpath $uninstallDist --workpath (Join-Path $PSScriptRoot 'installer\uninstall-build') --specpath (Join-Path $PSScriptRoot 'installer\spec') 'work\installer\installer.py' 2>&1 | Out-Null
+$uninstallCode = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($uninstallCode -ne 0) { throw 'Uninstaller build failed' }
+Copy-Item -LiteralPath (Join-Path $uninstallDist '卸载PDF标签编辑器.exe') -Destination $payload -Force
 Copy-Item -LiteralPath $exe -Destination $payload -Force
 foreach ($name in 'app.ico', 'pdf_doc.ico') {
     $source = Join-Path $app $name

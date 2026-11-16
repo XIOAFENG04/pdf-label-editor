@@ -1,7 +1,7 @@
 """User preferences stored in %APPDATA%\\PDF标签编辑器\\settings.json.
 
 Defaults are conservative: files open as tabs in one window, a page opens at
-actual size (100%), and the theme follows Windows.
+fit to the page, and the theme follows Windows.
 """
 import json
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 APP = 'PDF标签编辑器'
 DEFAULTS = {
     'open_mode': 'same_window',   # same_window | new_window
-    'default_zoom': 'percent',    # percent | actual | fit | fit_width | last
+    'default_zoom': 'fit',        # percent | actual | fit | fit_width | last
     'default_percent': 320,       # used by the percent mode
     'theme': 'system',            # system | light | dark
     'update_repo': 'XIOAFENG04/pdf-label-editor',   # GitHub 用户名/仓库名，用于检查更新
@@ -37,14 +37,12 @@ def load():
     except (OSError, ValueError):
         stored = {}
     if isinstance(stored, dict):
-        # Files written before the 320% default existed keep the old 'fit' choice
-        # and would ignore the new default, so migrate them once. Explicit
-        # PDFTOOL_SETTINGS files (tests) are left exactly as written.
-        if stored and 'settings_version' not in stored and not os.environ.get('PDFTOOL_SETTINGS'):
-            stored['default_zoom'] = 'percent'
-            stored['default_percent'] = 320
+        # Replace the former standard 320% default once; preserve other explicit
+        # zoom preferences and allow the user to select 320% again afterwards.
+        if stored.get('settings_version', 0) < 3 and stored.get('default_zoom') == 'percent' and stored.get('default_percent', 320) == 320:
+            stored['default_zoom'] = 'fit'
         data.update(stored)
-    data['settings_version'] = 2
+    data['settings_version'] = 3
     return data
 
 

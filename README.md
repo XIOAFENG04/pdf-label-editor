@@ -39,3 +39,7 @@ work/publish_release.ps1 -Version 1.0.1 -Notes "本次更新内容"
 ```
 
 脚本会打包安装程序、打 tag、创建 GitHub Release 并上传安装包；程序里的「检查更新」会读取该 Release。
+
+## 激活说明
+
+首次启动需要输入软件密钥。客户使用同一个密钥；如需获取密钥，请联系：730004921@qq.com。
