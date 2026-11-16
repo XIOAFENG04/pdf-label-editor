@@ -715,7 +715,7 @@ class PDFTool:
         if theme.is_dark():
             theme.restyle_tree(self.root)
         if self.prefs.get('theme') == 'system':
-            self.root.after(3000, self.watch_system_theme)
+            self.theme_job = self.root.after(3000, self.watch_system_theme)
 
     def enable_pdf_drop(self):
         try:
@@ -2331,7 +2331,7 @@ class PDFTool:
             wanted = theme.resolve('system')
             if wanted != ('dark' if theme.is_dark() else 'light'):
                 self.apply_theme('system')
-        self.root.after(3000, self.watch_system_theme)
+        self.theme_job = self.root.after(3000, self.watch_system_theme)
 
     def start_single_instance(self):
         """Accept files forwarded by later launches (double-clicked PDFs)."""
@@ -2374,6 +2374,13 @@ class PDFTool:
             if self.asset_db:
                 self.asset_db.close()
                 self.asset_db = None
+            for attr in ('theme_job', 'thumbnail_job', 'thumbnail_resize_job',
+                         '_assets_preview_job', '_scale_job', 'resize_job'):
+                job = getattr(self, attr, None)
+                if job:
+                    try: self.root.after_cancel(job)
+                    except tk.TclError: pass
+                    setattr(self, attr, None)
             self.root.destroy()
         finally:
             self.closing = False
@@ -3133,6 +3140,30 @@ class PDFTool:
 
     def barcode_group_at(self, objects, point):
         """Find a conservative cluster of parallel filled bars; leave borders separate."""
+        # Some shipping labels rotate their barcode: the bars then run
+        # horizontally and must be grouped along the vertical axis.
+        horizontal = []
+        for item in objects.items:
+            if item.get('kind') != 'shape' or not item.get('fill'): continue
+            rect = fitz.Rect(item['rect'])
+            if rect.width >= 8 and 0 < rect.height <= rect.width*.30 and rect.x0-2 <= point.x <= rect.x1+2:
+                horizontal.append((rect, item))
+        horizontal.sort(key=lambda pair: pair[0].y0)
+        for anchor, _ in sorted(horizontal, key=lambda pair: abs((pair[0].y0+pair[0].y1)/2-point.y))[:12]:
+            similar = [(r, it) for r, it in horizontal if abs(r.width-anchor.width) <= anchor.width*.20
+                       and abs((r.x0+r.x1)-(anchor.x0+anchor.x1)) <= anchor.width*.25]
+            groups, group = [], []
+            for r, it in similar:
+                if group and r.y0-group[-1][0].y1 > anchor.width*.30:
+                    groups.append(group); group = []
+                group.append((r, it))
+            if group: groups.append(group)
+            for group in groups:
+                if len(group) < 12: continue
+                bounds = fitz.Rect(group[0][0])
+                for r, _ in group[1:]: bounds |= r
+                if bounds.height >= bounds.width*.7 and bounds.contains(point):
+                    return bounds, {'kind':'barcode', 'members':[it['n'] for _, it in group]}
         eligible = []
         for item in objects.items:
             if item.get('kind') != 'shape' or not item.get('fill'): continue
@@ -3168,6 +3199,31 @@ class PDFTool:
         return numbers
 
     def matrix_group_at(self, objects, point):
+        # A QR code can consist of thick horizontal strokes, not filled squares.
+        strokes = []
+        for item in objects.items:
+            if item.get('kind') != 'shape' or not item.get('stroke') or item.get('fill'): continue
+            r = fitz.Rect(item['rect']); width = float(item.get('width') or 0)
+            if width > .2 and r.width >= width*.8 and r.height < width*.15:
+                strokes.append((r, item, width))
+        for anchor, _, unit in strokes:
+            if not (anchor + (-unit, -unit, unit, unit)).contains(point): continue
+            candidates = [(r,it) for r,it,w in strokes if abs(w-unit) <= unit*.15]
+            seed = next(i for i,(r,_) in enumerate(candidates) if r == anchor)
+            seen, pending = {seed}, [seed]
+            while pending:
+                r = candidates[pending.pop()][0]
+                for i,(q,_) in enumerate(candidates):
+                    if i not in seen and r.x0-unit*2 <= q.x1 and q.x0 <= r.x1+unit*2 and abs(q.y0-r.y0) <= unit*2:
+                        seen.add(i); pending.append(i)
+            if len(seen) < 40: continue
+            lines = [candidates[i][0] for i in seen]
+            bounds = fitz.Rect(min(r.x0 for r in lines)-unit/2,
+                               min(r.y0 for r in lines)-unit/2,
+                               max(r.x1 for r in lines)+unit/2,
+                               max(r.y1 for r in lines)+unit/2)
+            if min(bounds.width,bounds.height) >= 8*unit and .7 <= bounds.width/bounds.height <= 1.4:
+                return bounds, {'kind':'barcode', 'members':sorted(candidates[i][1]['n'] for i in seen)}
         squares = []
         for item in objects.items:
             if item.get('kind') != 'shape' or not item.get('fill'): continue
@@ -3985,7 +4041,8 @@ class PDFTool:
     def reselect_graphic(self, target, kind):
         if self.selected_object and self.selected_object.get('kind') == 'barcode':
             objects = page_objects.Objects(self.doc[self.page_index])
-            group = self.barcode_group_at(objects, (target.tl+target.br)/2)
+            group = (self.barcode_group_at(objects, (target.tl+target.br)/2)
+                     or self.matrix_group_at(objects, (target.tl+target.br)/2))
             if not group:
                 possible = [item for item in objects.items if item.get('kind') == 'shape' and target.contains(fitz.Rect(item['rect']))]
                 for item in possible[:20]:
@@ -4677,7 +4734,7 @@ class PDFTool:
         parts = value.split('\n')
         lines = state['lines']
         _, _, width, height = self.page_layout[index]
-        if (len(parts) != len(lines) or any(not part.strip() for part in parts)
+        if (not lines or any(not part.strip() for part in parts)
                 or len(value) > 2000 or len(self.doc) > 8 or width*height > 4_000_000):
             return None
         try:
@@ -4696,8 +4753,14 @@ class PDFTool:
                 candidates = [line for _, line in full_text_lines(page)]
                 starts, start = [], 0
                 previous_y = -math.inf
-                for old, part in zip(lines, parts):
+                for part_index, part in enumerate(parts):
+                    old = lines[min(part_index, len(lines)-1)]
                     ox, oy = old['spans'][0]['origin']
+                    if len(parts) != len(lines):
+                        # After Enter the writer reflows the paragraph. Match
+                        # its actual output rows rather than the old row count.
+                        ox = lines[0]['spans'][0]['origin'][0]
+                        oy = previous_y + .1 if math.isfinite(previous_y) else oy
                     offset = 0
                     while offset < len(part):
                         matches = []
