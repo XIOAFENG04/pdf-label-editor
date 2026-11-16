@@ -1,4 +1,4 @@
-"""Installer for PDF 标签编辑器.
+﻿"""Installer for PDF 标签编辑器.
 
 A single-file windowed executable that carries the application payload, asks
 where to install, copies the files, optionally creates desktop / Start-menu
@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = 'PDF 标签编辑器'
 APP_EXE = 'PDF标签编辑器.exe'
-VERSION = '1.1.4'
+VERSION = '1.1.5'
 PUBLISHER = 'PDF 标签编辑器'
 UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\PDFLabelEditor'
 CREATION_FLAGS = 0x08000000 if sys.platform == 'win32' else 0
