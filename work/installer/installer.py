@@ -29,7 +29,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = 'PDF 标签编辑器'
 APP_EXE = 'PDF标签编辑器.exe'
-VERSION = '1.1.8'
+VERSION = '1.1.20'
 PUBLISHER = 'PDF 标签编辑器'
 UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\PDFLabelEditor'
 CREATION_FLAGS = 0x08000000 if sys.platform == 'win32' else 0

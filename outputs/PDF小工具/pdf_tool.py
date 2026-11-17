@@ -710,6 +710,10 @@ class PDFTool:
         # Some keyboard layouts and IMEs report a different keysym for the
         # same physical key. Handle the Windows virtual-key code as a fallback.
         self.root.bind('<KeyPress>', self.shortcut_physical, add='+')
+        # Layout-independent Ctrl shortcuts.  Tk's ``<Control-p>`` depends on
+        # the active keyboard layout/IME; this handler also accepts the
+        # translated keysym and the Windows virtual-key code.
+        self.root.bind('<Control-KeyPress>', self.shortcut_layout, add='+')
         for event, action in [('<Control-Shift-S>', self.save_as), ('<Control-p>', self.print_pdf), ('<Control-plus>', lambda:self.zoom(1.1)), ('<Control-equal>', lambda:self.zoom(1.1)), ('<Control-minus>', lambda:self.zoom(1/1.1)), ('<Control-0>', self.fit_page), ('<Prior>', lambda:self.turn(-1)), ('<Next>', lambda:self.turn(1)), ('<Left>', lambda:self.canvas.xview_scroll(-3,'units')), ('<Right>', lambda:self.canvas.xview_scroll(3,'units')), ('<Up>', lambda:self.canvas.yview_scroll(-3,'units')), ('<Down>', lambda:self.canvas.yview_scroll(3,'units'))]:
             self.root.bind(event, lambda e, fn=action: self.shortcut(e, fn))
         self.root.protocol('WM_DELETE_WINDOW', self.close)
@@ -2142,12 +2146,31 @@ class PDFTool:
         if sys.platform != 'win32' or not (event.state & 0x4) or (event.state & 0x20000):
             return
         actions = {67: self.copy_area, 86: self.paste_area, 88: self.cut_area,
-                   90: self.undo, 89: self.redo}
+                   90: self.undo, 89: self.redo, 80: self.print_pdf,
+                   83: self.save, 79: self.open, 78: self.new_blank_dialog,
+                   87: self.close_tab}
         action = actions.get(event.keycode)
         if action is None:
             return
-        if event.keycode == 90 and event.state & 0x1:
+        if event.keycode == 83 and event.state & 0x1:
+            action = self.save_as
+        elif event.keycode == 90 and event.state & 0x1:
             action = self.redo
+        return self.shortcut(event, action)
+
+    def shortcut_layout(self, event):
+        """Handle Ctrl shortcuts when an IME/layout changes Tk's keysym."""
+        if event.state & 0x20000:  # AltGr is Ctrl+Alt, not an app shortcut.
+            return
+        names = {
+            'c': self.copy_area, 'v': self.paste_area, 'x': self.cut_area,
+            'z': self.undo, 'y': self.redo, 'p': self.print_pdf,
+            's': self.save_as if event.state & 0x1 else self.save,
+            'o': self.open, 'n': self.new_blank_dialog, 'w': self.close_tab,
+        }
+        action = names.get(str(event.keysym).lower())
+        if action is None:
+            return
         return self.shortcut(event, action)
 
     OPEN_MODES = {'同一窗口，新标签页': 'same_window', '每次打开新窗口': 'new_window'}
