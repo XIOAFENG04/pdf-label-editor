@@ -281,6 +281,8 @@ def printer_dc(printer_name, width_mm=70, height_mm=70, settings=None):
         spool.ClosePrinter(handle)
 
 class PDFTool:
+    CLIPBOARD_SENTINEL = 'PDF 标签编辑器内部内容'
+
     def restore_window_state(self):
         """Restore the window size/position and panel widths from the last session."""
         match = re.fullmatch(r'(\d+)x(\d+)(?:([+-]\d+)([+-]\d+))?', str(self.prefs.get('geometry') or ''))
@@ -858,7 +860,7 @@ class PDFTool:
 
     def asset_clipboard_data(self):
         seq = ctypes.windll.user32.GetClipboardSequenceNumber()
-        if self.clipboard_pdf is not None and seq == self.clipboard_sequence:
+        if self.clipboard_pdf is not None and (seq == self.clipboard_sequence or self.owns_internal_clipboard()):
             geometry = self.clipboard_box_geometry
             meta = {'size':list(self.clipboard_size), 'box':None, 'geometry':None}
             if self.clipboard_box:
@@ -915,6 +917,19 @@ class PDFTool:
         meta = {'size':[w,h], 'box':{'text':text,'keys':[key._asdict() for _ in text],'step':size*1.2},
                 'geometry':{'box':[0,0,w,h],'origin':[0,size],'rotation':0,'bounds':[0,0,w,h]}}
         return '文字：'+' '.join(text.split())[:18], data, meta
+
+    def owns_internal_clipboard(self):
+        """Return whether Windows still contains our internal clipboard marker.
+
+        The clipboard sequence number may change after a delayed clipboard
+        render, an IME update, or a clipboard manager touches the clipboard.
+        The marker is the reliable ownership check for content copied inside
+        this editor, so multiline PDF text is not downgraded to plain text.
+        """
+        try:
+            return self.root.clipboard_get() == self.CLIPBOARD_SENTINEL
+        except (tk.TclError, OSError):
+            return False
 
     def asset_geometry(self, geom):
         return {'box':fitz.Rect(geom['box']), 'origin':fitz.Point(geom['origin']),
@@ -5779,7 +5794,7 @@ class PDFTool:
             clip.close()
             self.clipboard_size = (rect.width, rect.height)
             self.root.clipboard_clear()
-            self.root.clipboard_append('PDF 标签编辑器内部内容')
+            self.root.clipboard_append(self.CLIPBOARD_SENTINEL)
             self.root.update_idletasks()
             self.clipboard_sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
             try:
@@ -5845,7 +5860,7 @@ class PDFTool:
             messagebox.showinfo('暂不能编辑', '此页带有旋转属性，当前版本不能安全粘贴。')
             return
         sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
-        internal = self.clipboard_pdf is not None and sequence == self.clipboard_sequence
+        internal = self.clipboard_pdf is not None and (sequence == self.clipboard_sequence or self.owns_internal_clipboard())
         if target_point is None and self.selection and not self.selection.is_empty:
             rect = fitz.Rect(self.selection)
         else:
@@ -5855,7 +5870,7 @@ class PDFTool:
                 center = (page_rect.tl+page_rect.br)/2
                 target_point = fitz.Point(center.x-width/2, center.y-height/2)
             rect = fitz.Rect(target_point.x,target_point.y,target_point.x+width,target_point.y+height)
-        if self.clipboard_pdf is None or sequence != self.clipboard_sequence:
+        if not internal:
             self.paste_system_clipboard(rect)
             return
         if self.clipboard_pdf is None:
