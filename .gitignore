@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -43,3 +43,8 @@ work/*.sqlite3
 work/ui-review.png
 *.sqlite3
 *.db
+
+# Build and installer artefacts (published as Release assets, never in git)
+outputs/*/
+!outputs/PDF小工具/
+

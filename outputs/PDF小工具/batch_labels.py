@@ -110,11 +110,82 @@ def detect_bitmap_labels(page):
     return results
 
 
+def enclosing_frame(page, rect):
+    """Smallest drawn frame that contains rect (the label border), or None."""
+    best = None
+    for item in page.get_drawings():
+        colour = item.get('color')
+        if colour is not None and max(colour[:3]) > .4:
+            continue
+        frame = fitz.Rect(item['rect'])
+        if frame.is_empty or not (frame + (-1, -1, 1, 1)).contains(rect):
+            continue
+        if frame.get_area() < rect.get_area():
+            continue
+        if best is None or frame.get_area() < best.get_area():
+            best = frame
+    return best
+
+
+def expand_to_label_content(page, rect):
+    """Grow a barcode box to the label text around it (title above, codes below).
+
+    Some suppliers ship the label as one flat picture: the barcode is an image and
+    the title/code lines are vector text above and below it. The barcode box alone
+    is only the middle strip, so the imported label lost its title and codes.
+    """
+    rect = fitz.Rect(rect)
+    frame = enclosing_frame(page, rect) or page.rect
+    try:
+        data = page.get_text('dict', clip=fitz.INFINITE_RECT())
+    except Exception:
+        return rect
+    boxes = []
+    for block in data.get('blocks') or []:
+        if block.get('type') != 0:
+            continue
+        for line in block.get('lines') or []:
+            if not line.get('spans'):
+                continue
+            value = ''.join(span.get('text', '') for span in line['spans']).strip()
+            if value:
+                boxes.append(fitz.Rect(line['bbox']))
+    if not boxes:
+        return rect & frame
+    grown = fitz.Rect(rect)
+    for _round in range(4):
+        height = max(4.0, grown.height)
+        changed = False
+        for box in boxes:
+            overlap = min(box.x1, grown.x1) - max(box.x0, grown.x0)
+            if overlap <= .4 * min(box.width, grown.width):
+                continue
+            if not (frame + (-1, -1, 1, 1)).contains(box):
+                continue
+            distance = max(grown.y0 - box.y1, box.y0 - grown.y1, 0.0)
+            if distance > height * .9:
+                continue
+            merged = fitz.Rect(grown) | box
+            if merged != grown:
+                grown = merged
+                changed = True
+        if not changed:
+            break
+    grown = (grown + (-.75, -.75, .75, .75)) & frame
+    # When the grown area is already most of the drawn frame, use the frame itself
+    # so the border line comes with the label.
+    if frame.get_area() <= grown.get_area() * 1.35:
+        grown = fitz.Rect(frame)
+    return grown
+
+
 def detect_full_label_barcodes(page):
     """Find full framed product barcodes; return all candidates for ambiguity checks."""
     if page.rotation:
         raise ValueError('旧标签页面带有旋转属性，请先调整页面方向。')
-    candidates = detect_bitmap_labels(page)
+    # Bitmap barcodes come back as the bare strip; grow them to the label text
+    # so the whole label is imported, not just the middle band.
+    candidates = [expand_to_label_content(page, rect) for rect in detect_bitmap_labels(page)]
     drawings = page.get_drawings()
     bars = []
     for item in drawings:
